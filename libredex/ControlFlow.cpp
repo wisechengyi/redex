@@ -40,11 +40,11 @@ void ControlFlowGraph::remove_all_edges(Block* p, Block* s) {
   p->m_succs.erase(std::remove_if(p->m_succs.begin(),
                                   p->m_succs.end(),
                                   [&](Block* b) { return b == s; }),
-                   p->succs().end());
+                   p->m_succs.end());
   s->m_preds.erase(std::remove_if(s->m_preds.begin(),
                                   s->m_preds.end(),
                                   [&](Block* b) { return b == p; }),
-                   s->preds().end());
+                   s->m_preds.end());
 }
 
 std::ostream& ControlFlowGraph::write_dot_format(std::ostream& o) const {
