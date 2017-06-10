@@ -11,6 +11,7 @@
 
 #include <boost/functional/hash.hpp>
 #include <utility>
+#include <vector>
 
 #include "Transform.h"
 
