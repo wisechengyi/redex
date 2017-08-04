@@ -255,7 +255,7 @@ inline std::vector<DexMethod*> devirtualize(const SignatureMap& sig_map) {
           continue;
         }
         for (const auto& meth : scope.methods) {
-          if (!meth.first->is_concrete()) continue;
+          // if (!meth.first->is_concrete()) continue;
           if (meth.second != FINAL) {
             break;
           }
