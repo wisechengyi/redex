@@ -78,12 +78,14 @@ std::ostream& operator<<(std::ostream& o, const Statement& stmt) {
 }
 
 struct SimpleBlock {
-  int id;
+  int num;
   vector<Statement> stmts;
+
+  int id() const { return num; }
 };
 
 std::ostream& operator<<(std::ostream& o, const SimpleBlock& block) {
-  o << "[Block ID: " << block.id << ", Statements: {";
+  o << "[Block ID: " << block.id() << ", Statements: {";
   for (const auto& stmt : block.stmts) {
     o << stmt << ", ";
   }
@@ -117,7 +119,7 @@ struct Program {
 
   void add(SimpleBlock* block) {
     m_blocks.push_back(block);
-    block->id = m_blocks.size() - 1;
+    block->num = m_blocks.size() - 1;
   }
 
   void add_edge(SimpleBlock* source, SimpleBlock* dest) {
@@ -249,11 +251,13 @@ class GlobalConstantPropagationTest : public ::testing::Test {
     build_program1();
     build_program2();
     build_program3();
+    build_program4();
   }
 
   Program m_program1;
   Program m_program2;
   Program m_program3;
+  Program m_program4;
 
  private:
   /*
@@ -437,11 +441,40 @@ class GlobalConstantPropagationTest : public ::testing::Test {
     m_program3.add_edge(b6, b8);
     m_program3.add_edge(b7, b8);
   }
+  /*
+    r1 = 1;           | B0
+    while (true) { <------------- r2 = 1; | B2
+      r2 = 2;         |
+      r3 = r1;        | B1
+      r4 = r2;        |
+    }
+  */
+  void build_program4() {
+    auto b0 = new SimpleBlock;
+    b0->stmts.push_back(Statement(1, int32_t(1)));
+    m_program4.add(b0);
+
+    auto b1 = new SimpleBlock;
+    b1->stmts.push_back(Statement(2, int32_t(2)));
+    b1->stmts.push_back(Statement(3, uint16_t(1)));
+    b1->stmts.push_back(Statement(4, uint16_t(2)));
+    m_program4.add(b1);
+
+    auto b2 = new SimpleBlock;
+    b2->stmts.push_back(Statement(2, int32_t(1)));
+    m_program4.add(b2);
+
+    m_program4.set_start_block(b0);
+
+    m_program4.add_edge(b0, b1);
+    m_program4.add_edge(b1, b1);
+    m_program4.add_edge(b2, b1);
+  }
 };
 
 void print_constants_in(Program& p, SkeletonConstantPropAnalysis& a) {
   for (const auto& block : p) {
-    printf("Block ID: %d\n", block->id);
+    printf("Block ID: %d\n", block->id());
     const auto& constants_in = a.get_constants_at_entry(block);
     cout << constants_in << "\n";
   }
@@ -666,4 +699,54 @@ TEST_F(GlobalConstantPropagationTest, testProgram3) {
 
   EXPECT_TRUE(stmt3.type == Statement::Type::NARROW_CONST && stmt3.dest == 7 &&
               stmt3.narrow_value == 3);
+}
+
+TEST_F(GlobalConstantPropagationTest, testProgram4) {
+  using namespace testing;
+
+  SkeletonConstantPropAnalysis constant_prop(m_program4);
+  constant_prop.run(ConstPropEnvironment());
+
+  // Block 0 at entry -> Top
+  EXPECT_TRUE(constant_prop.get_constants_at_entry(m_program4.get(0)).is_top());
+  // Block 0 at exit -> [r1: 1]
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(0))
+          .get(1)
+          .value()
+          .equals(ConstantValue(1, ConstantValue::ConstantType::NARROW)));
+
+  // Block 1 at entry -> [r1: 1]
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_entry(m_program4.get(1))
+          .get(1)
+          .value()
+          .equals(ConstantValue(1, ConstantValue::ConstantType::NARROW)));
+  // Block 1 at exit -> [r1: 1; r2:2; r3:1; r4:2]
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(1))
+          .get(1)
+          .value()
+          .equals(ConstantValue(1, ConstantValue::ConstantType::NARROW)));
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(1))
+          .get(2)
+          .value()
+          .equals(ConstantValue(2, ConstantValue::ConstantType::NARROW)));
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(1))
+          .get(3)
+          .value()
+          .equals(ConstantValue(1, ConstantValue::ConstantType::NARROW)));
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(1))
+          .get(4)
+          .value()
+          .equals(ConstantValue(2, ConstantValue::ConstantType::NARROW)));
+
+  // Block 2 is unreachable. Both its entry and exit states are _|_.
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_entry(m_program4.get(2)).is_bottom());
+  EXPECT_TRUE(
+      constant_prop.get_constants_at_exit(m_program4.get(2)).is_bottom());
 }

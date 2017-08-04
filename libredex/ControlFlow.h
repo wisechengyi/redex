@@ -39,6 +39,7 @@ struct Block {
  private:
   friend class ControlFlowGraph;
   friend class IRCode;
+  friend void transform::replace_block(IRCode*, Block*, Block*);
 
   size_t m_id;
   FatMethod::iterator m_begin;
@@ -51,15 +52,6 @@ inline bool is_catch(Block* b) {
   auto it = b->begin();
   return it->type == MFLOW_CATCH;
 }
-
-bool ends_with_may_throw(Block* b, bool end_block_before_throw = true);
-
-/*
- * Build a postorder sorted vector of blocks from the given CFG.  Uses a
- * standard depth-first search with a side table of already-visited nodes.
- */
-std::vector<Block*> postorder_sort(const std::vector<Block*>& cfg);
-
 
 class ControlFlowGraph {
   using IdPair = std::pair<size_t, size_t>;
@@ -95,8 +87,10 @@ class ControlFlowGraph {
    */
   std::ostream& write_dot_format(std::ostream&) const;
 
+  Block* find_block_that_ends_here(const FatMethod::iterator& loc) const;
+
  private:
-  EdgeFlags& edge(Block* pred, Block* succ) {
+  EdgeFlags& mutable_edge(Block* pred, Block* succ) {
     return m_edges[IdPair(pred->id(), succ->id())];
   }
 
@@ -107,3 +101,11 @@ class ControlFlowGraph {
 };
 
 std::vector<Block*> find_exit_blocks(const ControlFlowGraph&);
+
+bool ends_with_may_throw(Block* b, bool end_block_before_throw = true);
+
+/*
+ * Build a postorder sorted vector of blocks from the given CFG. Uses a
+ * standard depth-first search with a side table of already-visited nodes.
+ */
+std::vector<Block*> postorder_sort(const std::vector<Block*>& cfg);

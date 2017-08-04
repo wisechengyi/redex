@@ -7,12 +7,13 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
+#pragma once
+
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "Util.h"
-
-#pragma once
 
 #define TMS              \
   TM(ADD_REDEX_TXT)      \
@@ -30,11 +31,13 @@
   TM(DBGSTRIP)           \
   TM(DC)                 \
   TM(DCE)                \
+  TM(DEDUP_BLOCKS)       \
   TM(DELINIT)            \
   TM(DELMET)             \
   TM(DRAC)               \
   TM(EMPTY)              \
   TM(FINALINLINE)        \
+  TM(HOTNESS)            \
   TM(IDEX)               \
   TM(INL)                \
   TM(INTF)               \
@@ -50,6 +53,7 @@
   TM(PEEPHOLE)           \
   TM(PGR)                \
   TM(PM)                 \
+  TM(PTA)                \
   TM(REG)                \
   TM(RELO)               \
   TM(RENAME)             \
@@ -95,11 +99,10 @@ void trace(TraceModule module, int level, const char* fmt, ...);
 
 struct TraceContext {
   explicit TraceContext(const std::string& current_method) {
-    s_current_method = std::make_unique<std::string>(current_method);
+    s_current_method = current_method;
   }
-  ~TraceContext() {
-    s_current_method = nullptr;
-  }
+  ~TraceContext() { s_current_method.clear(); }
 
-  static std::unique_ptr<std::string> s_current_method;
+  thread_local static std::string s_current_method;
+  static std::mutex s_trace_mutex;
 };

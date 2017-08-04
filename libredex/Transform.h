@@ -20,7 +20,7 @@
 #include "DexClass.h"
 #include "DexDebugInstruction.h"
 #include "IRInstruction.h"
-#include "Liveness.h"
+#include "LivenessDeprecated.h"
 #include "Pass.h"
 
 enum TryEntryType {
@@ -44,6 +44,13 @@ struct CatchEntry {
   MethodItemEntry* next; // always null for catchall
   CatchEntry(DexType* catch_type): catch_type(catch_type), next(nullptr) {}
 };
+
+/**
+ * A SwitchIndices represents the set of int values matching a packed switch
+ * case. It could be the only value matching one case. There could also be a set
+ * of values matching a switch case.
+ */
+using SwitchIndices = std::set<int>;
 
 /*
  * Multi is where an opcode encodes more than
@@ -111,7 +118,9 @@ enum MethodItemType {
 struct MethodItemEntry {
   boost::intrusive::list_member_hook<> list_hook_;
   MethodItemType type;
+  // addr is not valid until sync
   uint32_t addr;
+
   union {
     TryEntry* tentry;
     CatchEntry* centry;
@@ -220,7 +229,7 @@ class IRCode {
       FatMethod::iterator cur,
       IRInstruction* insn,
       FatMethod::iterator* default_block,
-      std::map<int, FatMethod::iterator>& cases);
+      std::map<SwitchIndices, FatMethod::iterator>& cases);
 
   friend struct MethodCreator;
 
@@ -316,6 +325,9 @@ class IRCode {
   /* Like replace_opcode, but both :from and :to must be branch opcodes.
    * :to will end up jumping to the same destination as :from. */
   void replace_branch(IRInstruction* from, IRInstruction* to);
+
+  // remove all debug source code line numbers from this block
+  void remove_debug_line_info(Block* block);
 
   template <class... Args>
   void push_back(Args&&... args) {
@@ -492,14 +504,21 @@ using RegMap = std::unordered_map<uint16_t, uint16_t>;
 
 void remap_registers(IRCode*, const RegMap&);
 
+/*
+ * Sets all the opcodes in unreachable blocks to MFLOW_FALLTHROUGH, and removes
+ * all successor edges connecting them to the graph. Does not actually delete
+ * the blocks themselves.
+ *
+ * Return the number of instructions removed.
+ */
+size_t remove_unreachable_blocks(IRCode* code);
+
+// remove old_block
+// if new_block is not null, reroute old_targets predecessors to new_target
+void replace_block(IRCode* code, Block* old_block, Block* new_block);
+
+// if pos is inside a try block, return the corresponding catch
+// if not, return null
+MethodItemEntry* find_active_catch(IRCode* code, FatMethod::iterator pos);
+
 } // namespace transform
-
-namespace ir_code_impl {
-
-DexOpcode select_move_opcode(const IRInstruction* insn);
-
-DexOpcode select_const_opcode(const IRInstruction* insn);
-
-void select_instructions(IRCode* code);
-
-} // ir_code_impl

@@ -29,7 +29,6 @@
 #include "Util.h"
 #include "Warning.h"
 #include "Walkers.h"
-#include "WorkQueue.h"
 
 uint32_t DexString::length() const {
   if (is_simple()) {
@@ -698,6 +697,16 @@ void DexClass::sort_methods() {
   auto& dmeths = this->get_dmethods();
   std::sort(vmeths.begin(), vmeths.end(), compare_dexmethods);
   std::sort(dmeths.begin(), dmeths.end(), compare_dexmethods);
+}
+
+DexField* DexClass::find_field(const char* name, const DexType* field_type) const {
+  for (const auto f : m_ifields) {
+    if (std::strcmp(f->c_str(), name) == 0 && f->get_type() == field_type) {
+      return f;
+    }
+  }
+
+  return nullptr;
 }
 
 int DexClass::encode(DexOutputIdx* dodx,

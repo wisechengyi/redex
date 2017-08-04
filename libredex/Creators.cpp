@@ -303,6 +303,16 @@ void MethodBlock::check_cast(Location& src_and_dst, DexType* type) {
   push_instruction(check_cast);
 }
 
+void MethodBlock::instance_of(Location& obj, Location& dst, DexType* type) {
+  always_assert(obj.is_ref());
+  always_assert(dst.type == get_boolean_type());
+  IRInstruction* insn = new IRInstruction(OPCODE_INSTANCE_OF);
+  insn->set_dest(dst.get_reg());
+  insn->set_src(0, obj.get_reg());
+  insn->set_type(type);
+  push_instruction(insn);
+}
+
 void MethodBlock::ret(Location loc) {
   auto ch = type_shorty(loc.type);
   assert(ch != 'V');
@@ -320,6 +330,14 @@ void MethodBlock::ret(Location loc) {
 }
 
 void MethodBlock::ret_void() { push_instruction(new IRInstruction(OPCODE_RETURN_VOID)); }
+
+void MethodBlock::ret(DexType* rtype, Location loc) {
+  if (rtype != get_void_type()) {
+    ret(loc);
+  } else {
+    ret_void();
+  }
+}
 
 void MethodBlock::load_const(Location& loc, int32_t value) {
   always_assert(!loc.is_wide());
@@ -366,6 +384,16 @@ void MethodBlock::load_null(Location& loc) {
   push_instruction(load);
 }
 
+void MethodBlock::init_loc(Location& loc) {
+  if (loc.is_ref()) {
+    load_null(loc);
+  } else if (loc.is_wide()) {
+    load_const(loc, 0.0);
+  } else {
+    load_const(loc, 0);
+  }
+}
+
 void MethodBlock::binop_2addr(DexOpcode op,
                               const Location& dest,
                               const Location& src) {
@@ -374,6 +402,34 @@ void MethodBlock::binop_2addr(DexOpcode op,
   IRInstruction* insn = new IRInstruction(op);
   insn->set_src(0, dest.get_reg());
   insn->set_src(1, src.get_reg());
+  push_instruction(insn);
+}
+
+void MethodBlock::binop_lit16(DexOpcode op,
+                              const Location& dest,
+                              const Location& src,
+                              int16_t literal) {
+  always_assert(OPCODE_ADD_INT_LIT16 <= op && op <= OPCODE_XOR_INT_LIT16);
+  always_assert(dest.type == src.type);
+  always_assert(dest.type == get_int_type());
+  IRInstruction* insn = new IRInstruction(op);
+  insn->set_dest(dest.get_reg());
+  insn->set_src(0, src.get_reg());
+  insn->set_literal(literal);
+  push_instruction(insn);
+}
+
+void MethodBlock::binop_lit8(DexOpcode op,
+                             const Location& dest,
+                             const Location& src,
+                             int8_t literal) {
+  always_assert(OPCODE_ADD_INT_LIT8 <= op && op <= OPCODE_USHR_INT_LIT8);
+  always_assert(dest.type == src.type);
+  always_assert(dest.type == get_int_type());
+  IRInstruction* insn = new IRInstruction(op);
+  insn->set_dest(dest.get_reg());
+  insn->set_src(0, src.get_reg());
+  insn->set_literal(literal);
   push_instruction(insn);
 }
 
@@ -416,6 +472,27 @@ MethodBlock* MethodBlock::if_else_testz(DexOpcode if_op,
 
 MethodBlock* MethodBlock::switch_op(Location test,
                                     std::map<int, MethodBlock*>& cases) {
+  auto sw_opcode = new IRInstruction(OPCODE_PACKED_SWITCH);
+  sw_opcode->set_src(0, test.get_reg());
+  // Convert to SwitchIndices map.
+  std::map<SwitchIndices, MethodBlock*> indices_cases;
+  for (auto it : cases) {
+    SwitchIndices indices = {it.first};
+    indices_cases[indices] = it.second;
+  }
+  auto mb = make_switch_block(sw_opcode, indices_cases);
+  // Copy initialized case blocks back.
+  for (auto it : indices_cases) {
+    SwitchIndices indices = it.first;
+    always_assert(indices.size());
+    int idx = *indices.begin();
+    cases[idx] = it.second;
+  }
+  return mb;
+}
+
+MethodBlock* MethodBlock::switch_op(
+    Location test, std::map<SwitchIndices, MethodBlock*>& cases) {
   auto sw_opcode = new IRInstruction(OPCODE_PACKED_SWITCH);
   sw_opcode->set_src(0, test.get_reg());
   return make_switch_block(sw_opcode, cases);
@@ -479,9 +556,9 @@ FatMethod::iterator MethodCreator::make_if_else_block(
 }
 
 MethodBlock* MethodBlock::make_switch_block(
-    IRInstruction* insn, std::map<int, MethodBlock*>& cases) {
+    IRInstruction* insn, std::map<SwitchIndices, MethodBlock*>& cases) {
   FatMethod::iterator default_it;
-  std::map<int, FatMethod::iterator> mt_cases;
+  std::map<SwitchIndices, FatMethod::iterator> mt_cases;
   for (auto cases_it : cases) {
     mt_cases[cases_it.first] = curr;
   }
@@ -496,7 +573,7 @@ FatMethod::iterator MethodCreator::make_switch_block(
     FatMethod::iterator curr,
     IRInstruction* insn,
     FatMethod::iterator* default_block,
-    std::map<int, FatMethod::iterator>& cases) {
+    std::map<SwitchIndices, FatMethod::iterator>& cases) {
   return meth_code->make_switch_block(++curr, insn, default_block, cases);
 }
 

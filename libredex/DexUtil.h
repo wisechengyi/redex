@@ -87,12 +87,12 @@ DexType* get_enum_type();
 /**
  * Return true if the type is a primitive.
  */
-bool is_primitive(DexType* type);
+bool is_primitive(const DexType* type);
 
 /**
  * Return true if the type is either a long or a double
  */
-bool is_wide_type(DexType* type);
+bool is_wide_type(const DexType* type);
 
 /**
  * Return true if method signatures (name and proto) match.
@@ -108,7 +108,7 @@ inline bool signatures_match(const DexMethod* a, const DexMethod* b) {
  * ... primitive etc.
  * any reference -> L
  */
-char type_shorty(DexType* type);
+char type_shorty(const DexType* type);
 
 /**
  * Return true if the parent chain leads to known classes.
@@ -164,12 +164,17 @@ inline DexClass* type_class_internal(const DexType* t) {
  * you may effectively get false for a check_cast that would succeed at
  * runtime. Otherwise 'true' implies the type can cast.
  */
-bool check_cast(DexType* type, DexType* base_type);
+bool check_cast(const DexType* type, const DexType* base_type);
 
 /**
  * Return true if the type is an array type.
  */
 bool is_array(const DexType* type);
+
+/**
+ * Return true if the type is an object type (array types included).
+ */
+bool is_object(const DexType* type);
 
 /**
  * Return the level of the array type, that is the number of '[' in the array.
@@ -328,6 +333,25 @@ bool has_anno(const T* t, const DexType* anno_type) {
   }
   return false;
 }
+
+struct dex_stats_t {
+  int num_types = 0;
+  int num_classes = 0;
+  int num_methods = 0;
+  int num_method_refs = 0;
+  int num_fields = 0;
+  int num_field_refs = 0;
+  int num_strings = 0;
+  int num_protos = 0;
+  int num_static_values = 0;
+  int num_annotations = 0;
+  int num_type_lists = 0;
+  int num_bytes = 0;
+  int num_instructions = 0;
+};
+
+dex_stats_t&
+  operator+=(dex_stats_t& lhs, const dex_stats_t& rhs);
 
 namespace JavaNameUtil {
 

@@ -23,39 +23,6 @@
 #include "DexUtil.h"
 #include "Util.h"
 
-std::vector<Block*> postorder_sort(const std::vector<Block*>& cfg) {
-  std::vector<Block*> postorder;
-  std::vector<Block*> stack;
-  std::unordered_set<Block*> visited;
-  for (size_t i = 1; i < cfg.size(); i++) {
-    if (cfg[i]->preds().size() == 0) {
-      stack.push_back(cfg[i]);
-    }
-  }
-  stack.push_back(cfg[0]);
-  while (!stack.empty()) {
-    auto const& curr = stack.back();
-    visited.insert(curr);
-    bool all_succs_visited = [&] {
-      for (auto const& s : curr->succs()) {
-        if (!visited.count(s)) {
-          stack.push_back(s);
-          return false;
-        }
-      }
-      return true;
-    }();
-    if (all_succs_visited) {
-      assert(curr == stack.back());
-      postorder.push_back(curr);
-      stack.pop_back();
-    }
-  }
-  return postorder;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
 MethodItemEntry::MethodItemEntry(const MethodItemEntry& that)
     : type(that.type), addr(that.addr) {
   switch (type) {
@@ -849,6 +816,15 @@ void IRCode::replace_branch(IRInstruction* from, IRInstruction* to) {
       SHOW(to));
 }
 
+void IRCode::remove_debug_line_info(Block* block) {
+  for (MethodItemEntry& mie : *block) {
+    if (mie.type == MFLOW_POSITION) {
+      mie.type = MFLOW_FALLTHROUGH;
+      mie.pos.release();
+    }
+  }
+}
+
 void IRCode::replace_opcode_with_infinite_loop(IRInstruction* from) {
   IRInstruction* to = new IRInstruction(OPCODE_GOTO_32);
   to->set_offset(0);
@@ -1117,7 +1093,7 @@ FatMethod::iterator IRCode::make_switch_block(
     FatMethod::iterator cur,
     IRInstruction* insn,
     FatMethod::iterator* default_block,
-    std::map<int, FatMethod::iterator>& cases) {
+    std::map<SwitchIndices, FatMethod::iterator>& cases) {
   auto switch_entry = new MethodItemEntry(insn);
   *default_block = m_fmethod->insert(cur, *switch_entry);
   FatMethod::iterator main_block = *default_block;
@@ -1131,13 +1107,17 @@ FatMethod::iterator IRCode::make_switch_block(
     auto mb_entry = new MethodItemEntry(main_bt);
     main_block = m_fmethod->insert(++main_block, *mb_entry);
 
-    // case block
-    auto case_bt = new BranchTarget();
-    case_bt->src = switch_entry;
-    case_bt->index = case_it->first;
-    case_bt->type = BRANCH_MULTI;
-    auto eb_entry = new MethodItemEntry(case_bt);
-    case_it->second = m_fmethod->insert(goto_it, *eb_entry);
+    // Insert all the branch targets jumping from the switch entry.
+    // Keep updating the iterator of the case block to point right before the
+    // GOTO going back to the end of the switch.
+    for (auto idx : case_it->first) {
+      auto case_bt = new BranchTarget();
+      case_bt->src = switch_entry;
+      case_bt->index = idx;
+      case_bt->type = BRANCH_MULTI;
+      auto eb_entry = new MethodItemEntry(case_bt);
+      case_it->second = m_fmethod->insert(goto_it, *eb_entry);
+    }
   }
   return main_block;
 }
@@ -1372,6 +1352,106 @@ void remap_registers(IRCode* code, const RegMap& reg_map) {
   }
 }
 
+static size_t remove_block(IRCode* code, Block* b) {
+  size_t insns_removed{0};
+  for (auto& mei : InstructionIterable(b)) {
+    code->remove_opcode(mei.insn);
+    ++insns_removed;
+  }
+  return insns_removed;
+}
+
+size_t remove_unreachable_blocks(IRCode* code) {
+  auto& cfg = code->cfg();
+  auto& blocks = cfg.blocks();
+  size_t insns_removed{0};
+
+  // remove unreachable blocks
+  std::unordered_set<Block*> visited;
+  std::function<void (Block*)> visit = [&](Block* b) {
+    if (visited.find(b) != visited.end()) {
+      return;
+    }
+    visited.emplace(b);
+    for (auto& s : b->succs()) {
+      visit(s);
+    }
+  };
+  visit(blocks.at(0));
+  for (size_t i = 1; i < blocks.size(); ++i) {
+    auto& b = blocks.at(i);
+    if (visited.find(b) != visited.end()) {
+      continue;
+    }
+    // Remove all successor edges. Note that we don't need to try and remove
+    // predecessors since by definition, unreachable blocks have no preds
+    std::vector<std::pair<Block*, Block*>> remove_edges;
+    for (auto& s : b->succs()) {
+      remove_edges.emplace_back(b, s);
+    }
+    for (auto& p : remove_edges) {
+      cfg.remove_all_edges(p.first, p.second);
+    }
+    insns_removed += remove_block(code, b);
+  }
+
+  return insns_removed;
+}
+
+MethodItemEntry* find_active_catch(IRCode* code, FatMethod::iterator pos) {
+  while (++pos != code->end() && pos->type != MFLOW_TRY)
+    ;
+  return pos != code->end() && pos->tentry->type == TRY_END
+             ? pos->tentry->catch_start
+             : nullptr;
+}
+
+// delete old_block and reroute its predecessors to new_block
+//
+// if new_block is null, just delete old_block and don't reroute
+void replace_block(IRCode* code, Block* old_block, Block* new_block) {
+  const ControlFlowGraph& cfg = code->cfg();
+  std::vector<MethodItemEntry*> will_move;
+  if (new_block != nullptr) {
+    // make a copy of the targets we're going to move
+    for (MethodItemEntry& mie : *old_block) {
+      if (mie.type == MFLOW_TARGET) {
+        will_move.push_back(new MethodItemEntry(mie.target));
+      }
+    }
+  }
+
+  // delete old_block
+  for (auto it = old_block->begin(); it != old_block->end(); it++) {
+    switch (it->type) {
+    case MFLOW_OPCODE:
+      code->remove_opcode(it);
+      break;
+    case MFLOW_TARGET:
+      it->type = MFLOW_FALLTHROUGH;
+      it->throwing_mie = nullptr;
+      if (new_block == nullptr) {
+        delete it->target;
+      } // else, new_block takes ownership of the targets
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (new_block != nullptr) {
+    for (auto mie : will_move) {
+      // insert the branch target at the beginning of new_block
+      // and make sure `m_begin` and `m_end`s point to the right places
+      Block* before = cfg.find_block_that_ends_here(new_block->m_begin);
+      new_block->m_begin = code->insert_before(new_block->begin(), *mie);
+      if (before != nullptr) {
+        before->m_end = new_block->m_begin;
+      }
+    }
+  }
+}
+
 } // namespace transform
 
 /*
@@ -1533,13 +1613,6 @@ class MethodSplicer {
 
 namespace {
 
-MethodItemEntry* find_active_catch(FatMethod* method,
-                                   FatMethod::iterator pos) {
-  while (++pos != method->end() && pos->type != MFLOW_TRY);
-  return pos != method->end() && pos->tentry->type == TRY_END
-    ? pos->tentry->catch_start : nullptr;
-}
-
 /**
  * Return a RegSet indicating the registers that the callee interferes with
  * either via a check-cast to or by writing to one of the ins.
@@ -1571,6 +1644,7 @@ RegSet ins_reg_defs(IRCode& code) {
 }
 
 }
+
 
 void IRCode::inline_tail_call(DexMethod* caller,
                               DexMethod* callee,
@@ -1781,7 +1855,7 @@ bool IRCode::inline_method(InlineContext& context,
   }
 
   // check if we are in a try block
-  auto caller_catch = find_active_catch(fcaller, pos);
+  auto caller_catch = transform::find_active_catch(caller_code, pos);
 
   // Copy the callee up to the return. Everything else we push at the end
   // of the caller
@@ -1797,7 +1871,8 @@ bool IRCode::inline_method(InlineContext& context,
   splice(pos, fcallee->begin(), ret_it);
 
   // try items can span across a return opcode
-  auto callee_catch = splice.clone(find_active_catch(fcallee, ret_it));
+  auto callee_catch =
+      splice.clone(transform::find_active_catch(callee_code, ret_it));
   if (callee_catch != nullptr) {
     fcaller->insert(pos, *(new MethodItemEntry(TRY_END, callee_catch)));
     if (caller_catch != nullptr) {
@@ -1891,41 +1966,7 @@ void split_may_throw(FatMethod* fm, FatMethod::iterator it) {
     fm->insert(it, *MethodItemEntry::make_throwing_fallthrough(&mie));
   }
 }
-}
-
-bool ends_with_may_throw(Block* p, bool end_block_before_throw) {
-  if (!end_block_before_throw) {
-    for (auto last = p->rbegin(); last != p->rend(); ++last) {
-      if (last->type != MFLOW_OPCODE) {
-        continue;
-      }
-      return last->insn->opcode() == OPCODE_THROW ||
-             opcode::may_throw(last->insn->opcode());
-    }
-  }
-  for (auto last = p->rbegin(); last != p->rend(); ++last) {
-    switch (last->type) {
-    case MFLOW_FALLTHROUGH:
-      if (last->throwing_mie) {
-        return true;
-      }
-      break;
-    case MFLOW_OPCODE:
-      if (last->insn->opcode() == OPCODE_THROW) {
-        return true;
-      } else {
-        return false;
-      }
-    case MFLOW_TRY:
-    case MFLOW_CATCH:
-    case MFLOW_TARGET:
-    case MFLOW_POSITION:
-    case MFLOW_DEBUG:
-      break;
-    }
-  }
-  return false;
-}
+} // namespace
 
 void IRCode::clear_cfg() {
   m_cfg.reset();
@@ -1951,6 +1992,7 @@ void IRCode::build_cfg(bool end_block_before_throw) {
   bool in_try = false;
 
   auto* block = m_cfg->create_block();
+  always_assert_log(count_opcodes() > 0, "FatMethod contains no instructions");
   block->m_begin = m_fmethod->begin();
   m_cfg->set_entry_block(block);
   // The first block can be a branch target.
@@ -2056,9 +2098,9 @@ void IRCode::build_cfg(bool end_block_before_throw) {
           m_cfg->add_edge(block, catchblock, EDGE_THROW);
         }
       }
-      auto begin = block->begin();
-      if (begin->type == MFLOW_TRY) {
-        auto tentry = begin->tentry;
+      auto block_begin = block->begin();
+      if (block_begin->type == MFLOW_TRY) {
+        auto tentry = block_begin->tentry;
         if (tentry->type == TRY_START) {
           always_assert(tentry->catch_start == try_end->catch_start);
           break;
@@ -2143,142 +2185,6 @@ static void sync_load_params(const DexMethod* method,
   dex_code->set_ins_size(next_ins - ins_start);
 }
 
-/*
- * Helpers for select_instructions
- */
-
-/*
- * Returns an array of move opcodes of the appropriate type, sorted by
- * increasing size.
- */
-static std::array<DexOpcode, 3> move_opcode_tuple(DexOpcode op) {
-  switch (op) {
-  case OPCODE_MOVE:
-  case OPCODE_MOVE_FROM16:
-  case OPCODE_MOVE_16:
-    return {{OPCODE_MOVE, OPCODE_MOVE_FROM16, OPCODE_MOVE_16}};
-  case OPCODE_MOVE_WIDE:
-  case OPCODE_MOVE_WIDE_FROM16:
-  case OPCODE_MOVE_WIDE_16:
-    return {{OPCODE_MOVE_WIDE, OPCODE_MOVE_WIDE_FROM16, OPCODE_MOVE_WIDE_16}};
-  case OPCODE_MOVE_OBJECT:
-  case OPCODE_MOVE_OBJECT_FROM16:
-  case OPCODE_MOVE_OBJECT_16:
-    return {
-        {OPCODE_MOVE_OBJECT, OPCODE_MOVE_OBJECT_FROM16, OPCODE_MOVE_OBJECT_16}};
-  default:
-    not_reached();
-  }
-}
-
-DexOpcode select_move_opcode(const IRInstruction* insn) {
-  auto move_tuple = move_opcode_tuple(insn->opcode());
-  auto dest_width = required_bit_width(insn->dest());
-  auto src_width = required_bit_width(insn->src(0));
-  if (dest_width <= 4 && src_width <= 4) {
-    return move_tuple.at(0);
-  } else if (dest_width <= 8) {
-    return move_tuple.at(1);
-  } else {
-    return move_tuple.at(2);
-  }
-}
-
-/*
- * Returns whether the given value can fit in an integer of :width bits.
- */
-template <int width>
-static bool signed_int_fits(int64_t v) {
-  auto shift = 64 - width;
-  return (v << shift >> shift) == v;
-}
-
-/*
- * Returns whether the given value's significant bits can fit in the top 16
- * bits of an integer of :total_width bits. For example, since v is a signed
- * 64-bit int, a value v that can fit into the top 16 bits of a 32-bit int
- * would have the form 0xffffffffrrrr0000, where rrrr are the significant bits.
- */
-template <int total_width>
-static bool signed_int_fits_high16(int64_t v) {
-  auto right_zeros = total_width - 16;
-  auto left_ones = 64 - total_width;
-  return v >> right_zeros << (64 - 16) >> left_ones == v;
-}
-
-DexOpcode select_const_opcode(const IRInstruction* insn) {
-  auto op = insn->opcode();
-  auto dest_width = required_bit_width(insn->dest());
-  always_assert(dest_width <= 8);
-  auto literal = insn->literal();
-  switch (op) {
-  case OPCODE_CONST_4:
-  case OPCODE_CONST_16:
-  case OPCODE_CONST_HIGH16:
-  case OPCODE_CONST:
-    if (dest_width <= 4 && signed_int_fits<4>(literal)) {
-      return OPCODE_CONST_4;
-    } else if (signed_int_fits<16>(literal)) {
-      return OPCODE_CONST_16;
-    } else if (signed_int_fits_high16<32>(literal)) {
-      return OPCODE_CONST_HIGH16;
-    } else {
-      return OPCODE_CONST;
-    }
-  case OPCODE_CONST_WIDE_16:
-  case OPCODE_CONST_WIDE_32:
-  case OPCODE_CONST_WIDE_HIGH16:
-  case OPCODE_CONST_WIDE:
-    if (signed_int_fits<16>(literal)) {
-      return OPCODE_CONST_WIDE_16;
-    } else if (signed_int_fits<32>(literal)) {
-      return OPCODE_CONST_WIDE_32;
-    } else if (signed_int_fits_high16<64>(literal)) {
-      return OPCODE_CONST_WIDE_HIGH16;
-    } else {
-      return OPCODE_CONST_WIDE;
-    }
-  default:
-    not_reached();
-  }
-}
-
-/*
- * Pick the smallest opcode that can address its operands.
- *
- * Also insert move instructions as necessary for check-cast instructions that
- * have different src and dest registers.
- */
-void select_instructions(IRCode* code) {
-  auto ii = InstructionIterable(code);
-  auto end = ii.end();
-  for (auto it = ii.begin(); it != end; ++it) {
-    auto* insn = it->insn;
-    auto op = insn->opcode();
-    try_2addr_conversion(insn);
-    if (!RedexContext::next_release_gate()) {
-      continue;
-    }
-    if (op == OPCODE_CHECK_CAST && insn->dest() != insn->src(0)) {
-      // convert check-cast v0, v1 into
-      //
-      //   move v0, v1
-      //   check-cast v0
-      auto* mov = new IRInstruction(OPCODE_MOVE_OBJECT_16);
-      mov->set_dest(insn->dest());
-      mov->set_src(0, insn->src(0));
-      mov->set_opcode(select_move_opcode(mov));
-      insn->set_src(0, insn->dest());
-      code->insert_before(it.unwrap(), mov);
-    } else if (is_move(op)) {
-      insn->set_opcode(select_move_opcode(insn));
-    } else if (op >= OPCODE_CONST_4 && op <= OPCODE_CONST_WIDE) {
-      insn->set_opcode(select_const_opcode(insn));
-    }
-    // TODO: /lit8 and /lit16 instructions
-  }
-}
-
 } // namespace ir_code_impl
 
 using namespace ir_code_impl;
@@ -2287,7 +2193,6 @@ std::unique_ptr<DexCode> IRCode::sync(const DexMethod* method) {
   auto dex_code = std::make_unique<DexCode>();
   try {
     sync_load_params(method, this, &*dex_code);
-    select_instructions(this);
     dex_code->set_registers_size(m_registers_size);
     dex_code->set_outs_size(calc_outs_size(this));
     dex_code->set_debug_item(std::move(m_dbg));
@@ -2365,6 +2270,7 @@ bool IRCode::try_sync(DexCode* code) {
     auto& targets = multis[multiopcode];
     auto multi_insn = ir_to_dex_insn.at(multiopcode->insn);
     std::sort(targets.begin(), targets.end(), multi_target_compare_index);
+    always_assert_log(!targets.empty(), "need to have targets");
     if (multi_contains_gaps(targets)) {
       // Emit sparse.
       unsigned long count = (targets.size() * 4) + 2;

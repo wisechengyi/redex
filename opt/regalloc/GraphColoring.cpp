@@ -12,11 +12,70 @@
 #include <boost/pending/disjoint_sets.hpp>
 #include <boost/property_map/property_map.hpp>
 
+#include "ControlFlow.h"
 #include "Debug.h"
 #include "DexUtil.h"
 #include "VirtualRegistersFile.h"
 
 namespace regalloc {
+
+// We search for the first uses of param, similar to breadth first search,
+// if current_block don't have any use of param then we search its succ blocks.
+static void find_first_uses_dfs(
+    const std::unordered_map<Block*, LivenessDomain>& block_live_in,
+    reg_t param,
+    Block* current_block,
+    std::unordered_map<reg_t, std::vector<FatMethod::iterator>>& load_param,
+    std::unordered_set<Block*>* visited_blocks) {
+  visited_blocks->emplace(current_block);
+  // Search for first use of param in current_block.
+  for (auto it = current_block->begin(); it != current_block->end(); ++it) {
+    if (it->type != MFLOW_OPCODE) {
+      continue;
+    }
+    auto* insn = it->insn;
+    for (size_t i = 0; i < insn->srcs_size(); ++i) {
+      if (insn->src(i) == param) {
+        // There exist first use of param in this block, store this iterator
+        // in load_param and stop further discovering.
+        load_param[param].emplace_back(it);
+        return;
+      }
+    }
+  }
+  // If there are more than one branches contains param, then just load at end
+  // of this block to avoid having many loads uneccessarily.
+  int count = 0;
+  for (auto& s : current_block->succs()) {
+    if (block_live_in.at(s).contains(param) &&
+        visited_blocks->find(s) == visited_blocks->end()) {
+      count += 1;
+    }
+  }
+  if (count > 1) {
+    // There are more than 1 succ blocks we need to visit and find first uses,
+    // load at end of this block. Since for our ControlFlowGraph end of block
+    // is beginning of next block, so we need to check insn before end of block
+    // to make sure we didn't insert load after branches.
+    auto it = current_block->end();
+    auto prev_it = std::prev(it, 1);
+    if (prev_it->type == MFLOW_OPCODE &&
+        (is_branch(prev_it->insn->opcode()) ||
+         opcode::may_throw(prev_it->insn->opcode()))) {
+      it = prev_it;
+    }
+    load_param[param].emplace_back(it);
+    return;
+  }
+  // Search for use of param in succ blocks if live_in of succ block contains
+  // param and succ block has not been searched before.
+  for (auto& s : current_block->succs()) {
+    if (block_live_in.at(s).contains(param) &&
+        visited_blocks->find(s) == visited_blocks->end()) {
+      find_first_uses_dfs(block_live_in, param, s, load_param, visited_blocks);
+    }
+  }
+}
 
 /*
  * Given an invoke opcode, returns the number of virtual registers that it
@@ -217,6 +276,19 @@ std::string show(const SpillPlan& spill_plan) {
   return ss.str();
 }
 
+std::string show(const SplitPlan& split_plan) {
+  std::ostringstream ss;
+  ss << "split_around:\n";
+  for (auto pair : split_plan.split_around) {
+    ss << pair.first << ": ";
+    for (auto reg : pair.second) {
+      ss << reg << " ";
+    }
+    ss << "\n";
+  }
+  return ss.str();
+}
+
 std::string show(const interference::Graph& ig) {
   std::ostringstream ss;
   ig.write_dot_format(ss);
@@ -239,12 +311,32 @@ void Allocator::Stats::accumulate(const Allocator::Stats& that) {
   param_spill_moves += that.param_spill_moves;
   range_spill_moves += that.range_spill_moves;
   global_spill_moves += that.global_spill_moves;
+  split_moves += that.split_moves;
   moves_coalesced += that.moves_coalesced;
+  params_spill_early += that.params_spill_early;
+}
+
+static bool has_2addr_form(DexOpcode op) {
+  return op >= OPCODE_ADD_INT && op <= OPCODE_REM_DOUBLE;
 }
 
 /*
- * Coalesce symregs which have moves between them but which do not interfere
- * with each other. Remove the move instructions and combine the graph nodes.
+ * Coalesce symregs when there is potential for a more compact encoding. There
+ * are 3 kinds of instructions that have this opportunity:
+ *
+ *   * move instructions whose src and dest don't interfere can be removed
+ *
+ *   * instructions like add-int whose src(0) and dest don't interfere may
+ *     be encoded as add-int/2addr
+ *
+ *   * check-cast instructions with identical src and dest won't need to be
+ *     preceded by a move opcode in the output
+ *
+ * Coalescing means that we combine the interference graph nodes. If we have a
+ * move instruction, we remove it here. We shouldn't convert potentially
+ * 2addr-eligible opcodes to that form here because they ultimately may need
+ * the larger non-2addr encoding if their assigned vregs are larger than 4
+ * bits. They will be handled in the post-regalloc instruction selection phase.
  *
  * Return a bool indicating whether any coalescing was done.
  *
@@ -261,9 +353,9 @@ bool Allocator::coalesce(interference::Graph* ig, IRCode* code) {
   // Every time we coalesce a pair of symregs, we put them into the same
   // union-find tree. At the end of the coalescing process, we will map all the
   // symregs in each set to the root of that tree.
-  Rank rank;
-  Parent parent;
-  RegisterAliasSets aliases((RankPMap(rank)), (ParentPMap(parent)));
+  Rank rank_map;
+  Parent parent_map;
+  RegisterAliasSets aliases((RankPMap(rank_map)), (ParentPMap(parent_map)));
   for (size_t i = 0; i < code->get_registers_size(); ++i) {
     aliases.make_set(i);
   }
@@ -273,15 +365,18 @@ bool Allocator::coalesce(interference::Graph* ig, IRCode* code) {
   auto old_coalesce_count = m_stats.moves_coalesced;
   for (auto it = ii.begin(); it != end; ++it) {
     auto insn = it->insn;
-    if (!is_move(insn->opcode())) {
+    auto op = insn->opcode();
+    if (!is_move(op) && !has_2addr_form(op) && op != OPCODE_CHECK_CAST) {
       continue;
     }
     auto dest = aliases.find_set(insn->dest());
     auto src = aliases.find_set(insn->src(0));
     if (dest == src) {
-      ++m_stats.moves_coalesced;
-      code->remove_opcode(it.unwrap());
-    } else if (!ig->is_adjacent(dest, src)) {
+      if (is_move(op)) {
+        ++m_stats.moves_coalesced;
+        code->remove_opcode(it.unwrap());
+      }
+    } else if (ig->is_coalesceable(dest, src)) {
       // This unifies the two trees represented by dest and src
       aliases.link(dest, src);
       // Since link() doesn't tell us whether dest or src is the root of the
@@ -293,8 +388,10 @@ bool Allocator::coalesce(interference::Graph* ig, IRCode* code) {
       }
       // Merge the child's node into the parent's
       ig->combine(parent, child);
-      ++m_stats.moves_coalesced;
-      code->remove_opcode(it.unwrap());
+      if (is_move(op)) {
+        ++m_stats.moves_coalesced;
+        code->remove_opcode(it.unwrap());
+      }
     }
   }
 
@@ -408,6 +505,7 @@ void Allocator::select(const IRCode* code,
       reg_transform->map.emplace(reg, vreg);
     } else {
       spill_plan->global_spills.emplace(reg, vreg);
+      spill_plan->spill_costs.emplace(reg, 0);
     }
     vregs_size = std::max(vregs_size, vreg_file.size());
   }
@@ -548,6 +646,274 @@ void Allocator::select_params(const IRCode* code,
       ig, param_insns, params_base, vreg_files, reg_transform, spill_plan);
 }
 
+reg_t max_value_for_src(const interference::Graph& ig,
+                        const IRInstruction* insn,
+                        size_t src_index) {
+  auto& node = ig.get_node(insn->src(src_index));
+  auto max_value = max_unsigned_value(insn->src_bit_width(src_index));
+  if (is_invoke(insn->opcode()) && node.width() == 2) {
+    // We need to reserve one vreg for denormalization. See the
+    // comments in GraphBuilder::update_node_constraints() for details.
+    --max_value;
+  }
+  return max_value;
+}
+
+/*
+ * Calculate spill costs for possible global spill
+ */
+void Allocator::spill_costs(const IRCode* code,
+                            const interference::Graph& ig,
+                            const RangeSet& range_set,
+                            SpillPlan* spill_plan) {
+  auto ii = InstructionIterable(code);
+  auto end = ii.end();
+  for (auto it = ii.begin(); it != end; ++it) {
+    auto* insn = it->insn;
+    if (range_set.contains(insn)) {
+      continue;
+    }
+    // increment spilling costs for non-range symregs
+    for (size_t i = 0; i < insn->srcs_size(); ++i) {
+      auto src = insn->src(i);
+      auto max_value = max_value_for_src(ig, insn, i);
+      auto sp_it = spill_plan->global_spills.find(src);
+      if (sp_it != spill_plan->global_spills.end() &&
+          sp_it->second > max_value) {
+        ++(spill_plan->spill_costs[src]);
+      }
+    }
+    if (insn->dests_size()) {
+      auto dest = insn->dest();
+      auto max_value = max_unsigned_value(insn->dest_bit_width());
+      auto sp_it = spill_plan->global_spills.find(dest);
+      if (sp_it != spill_plan->global_spills.end() &&
+          sp_it->second > max_value) {
+        ++(spill_plan->spill_costs[dest]);
+      }
+    }
+  }
+}
+
+// Find out if there exist a
+//    invoke-xxx/fill-new-array v
+//    move-result u
+// if this exist then we can't split v around u, since splitting v around u
+// will result in inserting move in between. Return true if there exist
+// this situation for register u and v, false otherwise.
+bool bad_move_result(reg_t u, reg_t v, const SplitCosts& split_costs) {
+  for (auto mei : split_costs.get_write_result(u)) {
+    auto write_result_insn = mei->insn;
+    for (size_t i = 0; i < write_result_insn->srcs_size(); ++i) {
+      if (write_result_insn->src(i) == v) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// if reg was dead on the edge of try block to catch block,
+// all the try block to this catch block should has reg died on their edge,
+// otherwise avoid to split it. Return true if we should avoid split it,
+// return false otherwise.
+bool bad_catch(reg_t reg, const SplitCosts& split_costs) {
+  const auto& death_at_catch = split_costs.death_at_catch(reg);
+  for (auto pair : death_at_catch) {
+    if (pair.first->preds().size() != pair.second) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * Finding corresponding register that elements in spill_plan can split around
+ * or be split around.
+ */
+void Allocator::find_split(const interference::Graph& ig,
+                           const SplitCosts& split_costs,
+                           RegisterTransform* reg_transform,
+                           SpillPlan* spill_plan,
+                           SplitPlan* split_plan) {
+  std::unordered_set<reg_t> to_erase_spill;
+  auto& reg_map = reg_transform->map;
+  // Find best split/spill plan for all the global spill plan.
+  auto spill_it = spill_plan->global_spills.begin();
+  while (spill_it != spill_plan->global_spills.end()) {
+    auto reg = spill_it->first;
+    auto best_cost = spill_plan->spill_costs.at(reg);
+    if (best_cost == 0) {
+      ++spill_it;
+      continue;
+    }
+    reg_t best_vreg = 0;
+    bool split_found = false;
+    bool split_around_name = false;
+    // Find all the vregs assigned to reg's neighbors.
+    // Key is vreg, value is a set of registers that are mapped to this vreg.
+    std::unordered_map<reg_t, std::unordered_set<reg_t>> mapped_neighbors;
+    auto& node = ig.get_node(reg);
+    for (auto adj : node.adjacent()) {
+      auto it = reg_map.find(adj);
+      if (it != reg_map.end()) {
+        mapped_neighbors[it->second].emplace(adj);
+      }
+    }
+    auto max_reg_bound = ig.get_node(reg).max_vreg();
+    // For each vreg(color).
+    for (auto vreg_assigned : mapped_neighbors) {
+      // We only want to check neighbors that has vreg assigned that
+      // can be used by the reg.
+      if (vreg_assigned.first > max_reg_bound) {
+        continue;
+      }
+
+      // Try to split vreg around reg.
+      bool split_OK = true;
+      size_t cost = 0;
+      for (auto neighbor : vreg_assigned.second) {
+        if (bad_move_result(reg, neighbor, split_costs) ||
+            ig.has_containment_edge(neighbor, reg)) {
+          split_OK = false;
+          break;
+        } else {
+          cost += split_costs.total_value_at(reg);
+        }
+      }
+      if (split_OK && cost < best_cost) {
+        if (!bad_catch(reg, split_costs)) {
+          best_cost = cost;
+          best_vreg = vreg_assigned.first;
+          split_around_name = true;
+          split_found = true;
+        }
+      }
+
+      // Try to split reg around vreg.
+      split_OK = true;
+      cost = 0;
+      for (auto neighbor : vreg_assigned.second) {
+        if (bad_move_result(neighbor, reg, split_costs) ||
+            ig.has_containment_edge(reg, neighbor)) {
+          split_OK = false;
+          break;
+        } else {
+          if (bad_catch(neighbor, split_costs)) {
+            split_OK = false;
+            break;
+          }
+          cost += split_costs.total_value_at(neighbor);
+        }
+      }
+      if (split_OK && cost < best_cost) {
+        best_cost = cost;
+        best_vreg = vreg_assigned.first;
+        split_around_name = false;
+        split_found = true;
+      }
+    }
+
+    if (split_found) {
+      reg_map.emplace(reg, best_vreg);
+      auto neighbors = mapped_neighbors.at(best_vreg);
+      if (split_around_name) {
+        for (auto neighbor : neighbors) {
+          split_plan->split_around[reg].emplace(neighbor);
+        }
+      } else {
+        for (auto neighbor : neighbors) {
+          split_plan->split_around[neighbor].emplace(reg);
+        }
+      }
+      spill_it = spill_plan->global_spills.erase(spill_it);
+    } else {
+      ++spill_it;
+    }
+  }
+}
+
+// Function for finding first uses of params that need to be spilt.
+std::unordered_map<reg_t, std::vector<FatMethod::iterator>>
+Allocator::find_param_first_uses(const std::unordered_set<reg_t>& orig_params,
+                                 IRCode* code) {
+  std::unordered_map<reg_t, std::vector<FatMethod::iterator>> load_param;
+  if (orig_params.size() == 0) {
+    return load_param;
+  }
+  std::unordered_set<reg_t> params = orig_params;
+  // Erase parameter from list if there exist instructions overwriting the
+  // symreg.
+  auto pend = code->get_param_instructions().end();
+  auto ii = InstructionIterable(code);
+  auto end = ii.end();
+  for (auto it = ii.begin(); it != end; ++it) {
+    auto* insn = it->insn;
+    if (opcode::is_load_param(insn->opcode())) {
+      continue;
+    }
+    if (insn->dests_size()) {
+      auto dest = insn->dest();
+      if (params.find(dest) != params.end()) {
+        params.erase(dest);
+        load_param[dest].emplace_back(pend);
+        ++m_stats.params_spill_early;
+      }
+    }
+  }
+  if (params.size() == 0) {
+    return load_param;
+  }
+  // Get live_in value for each block.
+  std::unordered_map<Block*, LivenessDomain> block_live_in;
+  auto& cfg = code->cfg();
+  Block* start_block = cfg.entry_block();
+  LivenessFixpointIterator fixpoint_iter(const_cast<Block*>(cfg.exit_block()));
+  fixpoint_iter.run(LivenessDomain(code->get_registers_size()));
+  for (Block* block : cfg.blocks()) {
+    LivenessDomain live_in = fixpoint_iter.get_live_in_vars_at(block);
+    block_live_in[block] = live_in;
+  }
+  // Find first uses for each param.
+  for (auto param : params) {
+    std::unordered_set<Block*> visited_blocks;
+    find_first_uses_dfs(
+        block_live_in, param, start_block, load_param, &visited_blocks);
+  }
+  return load_param;
+}
+
+// Spill param registers by inserting load instructions either at end of load
+// param instruction lists, or before first uses of param register.
+void Allocator::spill_params(
+    const interference::Graph& ig,
+    const std::unordered_map<reg_t, std::vector<FatMethod::iterator>>&
+        load_param,
+    IRCode* code,
+    std::unordered_set<reg_t>* new_temps) {
+  auto param_insns = InstructionIterable(code->get_param_instructions());
+  std::unordered_map<reg_t, reg_t> param_to_temp;
+  for (auto& mie : param_insns) {
+    auto insn = mie.insn;
+    auto dest = insn->dest();
+    if (load_param.find(dest) != load_param.end()) {
+      auto temp = code->allocate_temp();
+      insn->set_dest(temp);
+      new_temps->emplace(temp);
+      param_to_temp[dest] = temp;
+    }
+  }
+  for (auto param_pair : load_param) {
+    auto dest = param_pair.first;
+    for (auto first_use_it : param_pair.second) {
+      code->insert_before(
+          first_use_it,
+          gen_move(ig.get_node(dest).type(), dest, param_to_temp.at(dest)));
+      ++m_stats.param_spill_moves;
+    }
+  }
+}
+
 /*
  * Insert loads before every use of a globally spilled symreg, and stores
  * after a def.
@@ -560,34 +926,14 @@ void Allocator::select_params(const IRCode* code,
  * the allocation loop.
  *
  * Param-related symregs are spilled by inserting loads just after the
- * block of parameter instructions. XXX We should probably optimize this by
- * inserting loads on the first use of those symregs...
+ * block of parameter instructions.
  */
 void Allocator::spill(const interference::Graph& ig,
                       const SpillPlan& spill_plan,
                       const RangeSet& range_set,
-                      IRCode* code) {
+                      IRCode* code,
+                      std::unordered_set<reg_t>* new_temps) {
   // TODO: account for "close" defs and uses. See [Briggs92], section 8.7
-
-  std::unordered_set<reg_t> new_temps;
-  // Spill param symregs
-  auto param_insns = InstructionIterable(code->get_param_instructions());
-  auto pend = param_insns.end();
-  std::vector<IRInstruction*> param_moves;
-  for (auto it = param_insns.begin(); it != pend; ++it) {
-    auto insn = it->insn;
-    auto dest = insn->dest();
-    if (spill_plan.param_spills.find(dest) != spill_plan.param_spills.end()) {
-      auto temp = code->allocate_temp();
-      insn->set_dest(temp);
-      new_temps.emplace(temp);
-      param_moves.emplace_back(gen_move(ig.get_node(dest).type(), dest, temp));
-      ++m_stats.param_spill_moves;
-    }
-  }
-  for (auto* insn : param_moves) {
-    code->insert_before(pend.unwrap(), insn);
-  }
 
   auto ii = InstructionIterable(code);
   auto end = ii.end();
@@ -606,7 +952,7 @@ void Allocator::spill(const interference::Graph& ig,
           auto& node = ig.get_node(src);
           auto temp = code->allocate_temp();
           insn->set_src(i, temp);
-          new_temps.emplace(temp);
+          new_temps->emplace(temp);
           auto mov = gen_move(node.type(), temp, src);
           ++m_stats.range_spill_moves;
           code->insert_before(it.unwrap(), mov);
@@ -617,17 +963,12 @@ void Allocator::spill(const interference::Graph& ig,
       for (size_t i = 0; i < insn->srcs_size(); ++i) {
         auto src = insn->src(i);
         // We've already spilt this when handling range / param nodes above
-        if (new_temps.find(src) != new_temps.end()) {
+        if (new_temps->find(src) != new_temps->end()) {
           continue;
         }
         auto& node = ig.get_node(src);
         auto sp_it = spill_plan.global_spills.find(src);
-        auto max_value = max_unsigned_value(insn->src_bit_width(i));
-        if (is_invoke(insn->opcode()) && node.width() == 2) {
-          // We need to reserve one vreg for denormalization. See the
-          // comments in GraphBuilder::update_node_constraints() for details.
-          --max_value;
-        }
+        auto max_value = max_value_for_src(ig, insn, i);
         if (sp_it != spill_plan.global_spills.end() &&
             sp_it->second > max_value) {
           auto temp = code->allocate_temp();
@@ -668,7 +1009,7 @@ void Allocator::spill(const interference::Graph& ig,
  *     account for. These are handled in select_ranges and select_params
  *     respectively.
  */
-void Allocator::allocate(IRCode* code) {
+void Allocator::allocate(bool use_splitting, IRCode* code) {
 
   // Any temp larger than this is the result of the spilling process
   auto initial_regs = code->get_registers_size();
@@ -680,7 +1021,9 @@ void Allocator::allocate(IRCode* code) {
 
   bool first{true};
   while (true) {
+    SplitCosts split_costs;
     SpillPlan spill_plan;
+    SplitPlan split_plan;
     RegisterTransform reg_transform;
 
     TRACE(REG, 5, "Allocating:\n%s\n", SHOW(code->cfg()));
@@ -688,15 +1031,15 @@ void Allocator::allocate(IRCode* code) {
     if (first) {
       coalesce(&ig, code);
       first = false;
+      TRACE(REG, 5, "Post-coalesce:\n%s\n", SHOW(code->cfg()));
     } else {
       // TODO we should coalesce here too, but we'll need to avoid removing
       // moves that were inserted by spilling
 
       // If we've hit this many iterations, it's very likely that we've hit
       // some bug that's causing us to loop infinitely.
-      always_assert(m_stats.reiteration_count++ < 50);
+      always_assert(m_stats.reiteration_count++ < 200);
     }
-    TRACE(REG, 5, "Post-coalesce:\n%s\n", SHOW(code->cfg()));
     TRACE(REG, 7, "IG:\n%s", SHOW(ig));
 
     std::stack<reg_t> select_stack;
@@ -711,7 +1054,24 @@ void Allocator::allocate(IRCode* code) {
 
     if (!spill_plan.empty()) {
       TRACE(REG, 5, "Spill plan:\n%s\n", SHOW(spill_plan));
-      spill(ig, spill_plan, range_set, code);
+      if (use_splitting) {
+        spill_costs(code, ig, range_set, &spill_plan);
+        calc_split_costs(code, &split_costs);
+        find_split(ig, split_costs, &reg_transform, &spill_plan, &split_plan);
+      }
+      auto load_param = find_param_first_uses(spill_plan.param_spills, code);
+      std::unordered_set<reg_t> new_temps;
+      if (load_param.size() > 0) {
+        spill_params(ig, load_param, code, &new_temps);
+      }
+      spill(ig, spill_plan, range_set, code, &new_temps);
+      if (split_plan.split_around.size() > 0) {
+        TRACE(REG, 5, "Split plan:\n%s\n", SHOW(split_plan));
+        m_stats.split_moves += split(split_plan, split_costs, ig, code);
+        // Since in split we might have inserted new blocks to load between
+        // blocks. So we call build_cfg() again to have a correct cfg.
+        code->build_cfg();
+      }
     } else {
       transform::remap_registers(code, reg_transform.map);
       code->set_registers_size(reg_transform.size);
@@ -724,7 +1084,9 @@ void Allocator::allocate(IRCode* code) {
   TRACE(REG, 3, "  Param spills: %lu\n", m_stats.param_spill_moves);
   TRACE(REG, 3, "  Range spills: %lu\n", m_stats.range_spill_moves);
   TRACE(REG, 3, "  Global spills: %lu\n", m_stats.global_spill_moves);
+  TRACE(REG, 3, "  splits: %lu\n", m_stats.split_moves);
   TRACE(REG, 3, "Coalesce count: %lu\n", m_stats.moves_coalesced);
+  TRACE(REG, 3, "Params spilled too early: %lu\n", m_stats.params_spill_early);
   TRACE(REG, 3, "Net moves: %ld\n", m_stats.net_moves());
 }
 

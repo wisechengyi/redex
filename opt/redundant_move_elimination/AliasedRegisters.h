@@ -9,7 +9,10 @@
 
 #pragma once
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
 #include <boost/graph/adjacency_list.hpp>
+#pragma GCC diagnostic pop
 #include <boost/optional.hpp>
 #include <boost/range/iterator_range.hpp>
 
@@ -28,12 +31,12 @@ struct RegisterValue {
     NONE,
   } kind;
 
-  const union {
-    Register const reg;
-    int64_t const literal;
-    DexString* const str;
-    DexType* const type;
-    std::nullptr_t const dummy;
+  union {
+    Register reg;
+    int64_t literal;
+    DexString* str;
+    DexType* type;
+    std::nullptr_t dummy;
   };
 
   explicit RegisterValue(Register r) : kind(Kind::REGISTER), reg(r) {}

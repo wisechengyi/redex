@@ -39,6 +39,11 @@ struct Location {
    */
   bool is_wide() const { return loc_size(type) == 2; }
 
+  bool is_ref() const {
+    char t = type_shorty(type);
+    return t == 'L' || t == '[';
+  }
+
   /**
    * Return the type of this location.
    */
@@ -179,6 +184,9 @@ struct MethodBlock {
    */
   void check_cast(Location& src_and_dst, DexType* type);
 
+
+  void instance_of(Location& obj, Location& dst, DexType* type);
+
   /**
    * Return the given location.
    */
@@ -188,6 +196,11 @@ struct MethodBlock {
    * Return void.
    */
   void ret_void();
+
+  /**
+   * Return the given location based on its type.
+   */
+  void ret(DexType* rtype, Location loc);
 
   /**
    * Load an int32 constant into the given Location.
@@ -218,7 +231,18 @@ struct MethodBlock {
    */
   void load_null(Location& loc);
 
-  void binop_2addr(DexOpcode op, const Location&, const Location&);
+  // Helper
+  void init_loc(Location& loc);
+
+  void binop_2addr(DexOpcode op, const Location& dest, const Location& src);
+  void binop_lit16(DexOpcode op,
+                   const Location& dest,
+                   const Location& src,
+                   int16_t literal);
+  void binop_lit8(DexOpcode op,
+                  const Location& dest,
+                  const Location& src,
+                  int8_t literal);
 
   //
   // branch instruction
@@ -318,6 +342,8 @@ struct MethodBlock {
    *   goto end_switch_label // emitted automatically
    */
   MethodBlock* switch_op(Location test, std::map<int, MethodBlock*>& cases);
+  MethodBlock* switch_op(Location test,
+                         std::map<SwitchIndices, MethodBlock*>& cases);
 
  private:
   MethodBlock(FatMethod::iterator iterator, MethodCreator* creator);
@@ -330,7 +356,7 @@ struct MethodBlock {
   MethodBlock* make_if_block(IRInstruction* insn);
   MethodBlock* make_if_else_block(IRInstruction* insn, MethodBlock** true_block);
   MethodBlock* make_switch_block(IRInstruction* insn,
-                                 std::map<int, MethodBlock*>& cases);
+                                 std::map<SwitchIndices, MethodBlock*>& cases);
 
  private:
   MethodCreator* mc;
@@ -442,7 +468,7 @@ struct MethodCreator {
       FatMethod::iterator curr,
       IRInstruction* opcode,
       FatMethod::iterator* default_block,
-      std::map<int, FatMethod::iterator>& cases);
+      std::map<SwitchIndices, FatMethod::iterator>& cases);
 
  private:
   DexMethod* method;

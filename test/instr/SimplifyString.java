@@ -15,6 +15,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 public class SimplifyString {
+
   @Test
   public void test_Coalesce_InitVoid_AppendString() {
     StringBuilder a, b;

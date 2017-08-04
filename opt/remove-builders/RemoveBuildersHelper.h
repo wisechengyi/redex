@@ -75,7 +75,8 @@ struct FieldsRegs {
 bool tainted_reg_escapes(
     DexType* type,
     DexMethod* method,
-    const std::unordered_map<IRInstruction*, TaintedRegs>& taint_map);
+    const std::unordered_map<IRInstruction*, TaintedRegs>& taint_map,
+    bool enable_buildee_constr_change = false);
 
 void transfer_object_reach(DexType* object,
                            uint16_t regs_size,
@@ -93,10 +94,6 @@ class BuilderTransform {
                    const Scope& scope,
                    DexStoresVector& stores,
                    bool throws_inline) {
-    m_inliner_config.callee_direct_invoke_inline = true;
-    m_inliner_config.virtual_same_class_inline = true;
-    m_inliner_config.super_same_class_inline = true;
-    m_inliner_config.use_liveness = true;
     m_inliner_config.use_liveness = !RedexContext::assume_regalloc();
     m_inliner_config.throws_inline = throws_inline;
 

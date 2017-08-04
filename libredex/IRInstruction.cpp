@@ -54,37 +54,6 @@ DexOpcode opcode_range_version(DexOpcode op) {
 
 } // namespace
 
-bool is_commutative(DexOpcode op) {
-  return op == OPCODE_ADD_INT || op == OPCODE_MUL_INT ||
-         (op >= OPCODE_AND_INT && op <= OPCODE_XOR_INT) ||
-         op == OPCODE_ADD_LONG || op == OPCODE_MUL_LONG ||
-         (op >= OPCODE_AND_LONG && op <= OPCODE_XOR_LONG) ||
-         op == OPCODE_ADD_FLOAT || op == OPCODE_MUL_FLOAT ||
-         op == OPCODE_ADD_DOUBLE || op == OPCODE_MUL_DOUBLE;
-}
-
-void try_2addr_conversion(IRInstruction* insn) {
-  auto op = insn->opcode();
-  if (is_commutative(op) && insn->dest() == insn->src(1) &&
-      insn->dest() <= 0xf && insn->src(0) <= 0xf) {
-    uint16_t reg_temp = insn->src(0);
-    insn->set_src(0, insn->src(1));
-    insn->set_src(1, reg_temp);
-    insn->set_opcode(convert_3to2addr(op));
-  } else if (op >= OPCODE_ADD_INT && op <= OPCODE_REM_DOUBLE &&
-             insn->dest() == insn->src(0) && insn->dest() <= 0xf &&
-             insn->src(1) <= 0xf) {
-    insn->set_opcode(convert_3to2addr(op));
-  }
-}
-
-bool can_use_2addr(const IRInstruction* insn) {
-  auto op = insn->opcode();
-  return op >= OPCODE_ADD_INT && op <= OPCODE_REM_DOUBLE &&
-         insn->dest() == insn->src(0) && insn->dest() <= 0xf &&
-         insn->src(1) <= 0xf;
-}
-
 DexOpcode convert_2to3addr(DexOpcode op) {
   always_assert(op >= OPCODE_ADD_INT_2ADDR && op <= OPCODE_REM_DOUBLE_2ADDR);
   constexpr uint16_t offset = OPCODE_ADD_INT_2ADDR - OPCODE_ADD_INT;
@@ -137,13 +106,14 @@ IRInstruction::IRInstruction(const DexInstruction* insn) {
   }
 }
 
+// Structural equality of opcodes except branches offsets are ignored
+// because they are unknown until we sync back to DexInstructions.
 bool IRInstruction::operator==(const IRInstruction& that) const {
   return m_opcode == that.m_opcode &&
     m_string == that.m_string && // just test one member of the union
     m_srcs == that.m_srcs &&
     m_dest == that.m_dest &&
     m_literal == that.m_literal &&
-    m_offset == that.m_offset &&
     m_range == that.m_range;
 }
 
@@ -194,8 +164,7 @@ uint16_t IRInstruction::size() const {
       0, /* FMT_fopcode   */
       0, /* FMT_iopcode   */
   };
-  auto op = can_use_2addr(this) ? convert_3to2addr(opcode()) : opcode();
-  return args[opcode::format(op)];
+  return args[opcode::format(opcode())];
 }
 
 DexInstruction* IRInstruction::to_dex_instruction() const {
@@ -410,6 +379,7 @@ void IRInstruction::normalize_registers() {
       ++old_srcs_idx;
     }
     for (size_t args_idx = 0; args_idx < args.size(); ++args_idx) {
+      always_assert(old_srcs_idx < srcs_size());
       set_src(srcs_idx++, src(old_srcs_idx));
       old_srcs_idx += is_wide_type(args.at(args_idx)) ? 2 : 1;
     }

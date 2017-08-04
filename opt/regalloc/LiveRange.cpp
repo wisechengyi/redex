@@ -14,8 +14,8 @@
 
 #include "ControlFlow.h"
 #include "FixpointIterators.h"
-#include "HashedAbstractEnvironment.h"
-#include "HashedSetAbstractDomain.h"
+#include "PatriciaTreeMapAbstractEnvironment.h"
+#include "PatriciaTreeSetAbstractDomain.h"
 #include "Transform.h"
 
 namespace {
@@ -53,6 +53,8 @@ class SymRegMapper {
    }
 };
 
+using UDChains = std::unordered_map<Use, PatriciaTreeSet<Def>>;
+
 /*
  * Put all defs with a use in common into the same set.
  */
@@ -69,7 +71,7 @@ void unify_defs(const UDChains& chains, DefSets* def_sets) {
 }
 
 class DefsDomain final : public AbstractDomainReverseAdaptor<
-                             HashedSetAbstractDomain<IRInstruction*>,
+                             PatriciaTreeSetAbstractDomain<IRInstruction*>,
                              DefsDomain> {
  public:
   using AbstractDomainReverseAdaptor::AbstractDomainReverseAdaptor;
@@ -86,14 +88,15 @@ class DefsDomain final : public AbstractDomainReverseAdaptor<
     return unwrap().size();
   }
 
-  const std::unordered_set<IRInstruction*>& elements() const {
+  const PatriciaTreeSet<IRInstruction*>& elements() const {
     return unwrap().elements();
   }
 };
 
-class DefsEnvironment final : public AbstractDomainReverseAdaptor<
-                                  HashedAbstractEnvironment<reg_t, DefsDomain>,
-                                  DefsEnvironment> {
+class DefsEnvironment final
+    : public AbstractDomainReverseAdaptor<
+          PatriciaTreeMapAbstractEnvironment<reg_t, DefsDomain>,
+          DefsEnvironment> {
  public:
   using AbstractDomainReverseAdaptor::AbstractDomainReverseAdaptor;
 
@@ -141,7 +144,6 @@ class ReachingDefsFixpointIterator final
 };
 
 UDChains calculate_ud_chains(IRCode* code) {
-  code->build_cfg();
   auto& cfg = code->cfg();
   ReachingDefsFixpointIterator fixpoint_iter(
       cfg, const_cast<Block*>(cfg.entry_block()));

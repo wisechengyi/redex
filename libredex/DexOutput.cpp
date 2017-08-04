@@ -339,7 +339,7 @@ typedef std::map<DexAnnotationDirectory*, uint32_t> adirmap_t;
 
 class DexOutput {
 public:
-  dex_output_stats_t m_stats;
+  dex_stats_t m_stats;
  private:
   DexClasses* m_classes;
   DexOutputIdx* dodx;
@@ -724,14 +724,9 @@ void DexOutput::generate_class_data_items() {
   insert_map_item(TYPE_CLASS_DATA_ITEM, (uint32_t) m_cdi_offsets.size(), cdi_start);
 }
 
-static void mt_sync(void* arg) {
-  auto method = reinterpret_cast<DexMethod*>(arg);
-  method->sync();
-}
-
 static void sync_all(const Scope& scope) {
   constexpr bool serial = false; // for debugging
-  std::vector<work_item> workitems;
+  auto wq = workqueue_foreach<DexMethod*>([](DexMethod* m){m->sync();});
   walk_code(scope,
             [](DexMethod*) { return true; },
             [&](DexMethod* m, IRCode&) {
@@ -739,11 +734,10 @@ static void sync_all(const Scope& scope) {
                 TRACE(MTRANS, 2, "Syncing %s\n", SHOW(m));
                 m->sync();
               } else {
-                workitems.push_back(work_item{mt_sync, m});
+                wq.add_item(m);
               }
             });
-  WorkQueue wq;
-  wq.run_work_items(workitems.data(), (int)workitems.size());
+  wq.run_all();
 }
 
 void DexOutput::generate_code_items(const std::vector<SortMode>& mode) {
@@ -1346,7 +1340,7 @@ static SortMode make_sort_bytecode(const std::string& sort_bytecode) {
   }
 }
 
-dex_output_stats_t
+dex_stats_t
 write_classes_to_dex(
   std::string filename,
   DexClasses* classes,
@@ -1434,22 +1428,4 @@ make_locator_index(DexStoresVector& stores)
   }
 
   return index;
-}
-
-dex_output_stats_t&
-  operator+=(dex_output_stats_t& lhs, const dex_output_stats_t& rhs) {
-  lhs.num_types += rhs.num_types;
-  lhs.num_classes += rhs.num_classes;
-  lhs.num_methods += rhs.num_methods;
-  lhs.num_method_refs += rhs.num_method_refs;
-  lhs.num_fields += rhs.num_fields;
-  lhs.num_field_refs += rhs.num_field_refs;
-  lhs.num_strings += rhs.num_strings;
-  lhs.num_protos += rhs.num_protos;
-  lhs.num_static_values += rhs.num_static_values;
-  lhs.num_annotations += rhs.num_annotations;
-  lhs.num_type_lists += rhs.num_type_lists;
-  lhs.num_bytes += rhs.num_bytes;
-  lhs.num_instructions += rhs.num_instructions;
-  return lhs;
 }

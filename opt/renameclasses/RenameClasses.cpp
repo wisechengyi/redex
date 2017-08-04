@@ -21,7 +21,7 @@
 #include "IRInstruction.h"
 #include "DexUtil.h"
 #include "ReachableClasses.h"
-#include "TypeSystem.h"
+#include "ClassHierarchy.h"
 
 #define MAX_DESCRIPTOR_LENGTH (1024)
 #define MAX_IDENT_CHAR (52)
@@ -100,9 +100,9 @@ bool should_rename(DexClass *clazz,
   }
   auto chstring = clazz->get_type()->get_name()->c_str();
   /* We're assuming anonymous classes are safe always safe to rename. */
-  auto substr = strrchr(chstring, '$');
-  if (substr != nullptr) {
-    auto val = *++substr;
+  auto last_cash = strrchr(chstring, '$');
+  if (last_cash != nullptr) {
+    auto val = *++last_cash;
     if (val >= '0' && val <= '9') {
       match_inner++;
       return true;

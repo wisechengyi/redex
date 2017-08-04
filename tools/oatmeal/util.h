@@ -51,6 +51,10 @@ uint32_t align(uint32_t in) {
   return (in + (Width - 1)) & -Width;
 }
 
+inline uint32_t align(uint32_t width, uint32_t in) {
+  return (in + (width - 1)) & -width;
+}
+
 template <uint32_t Width>
 bool is_aligned(uint32_t in) {
   return (in & (Width - 1)) == 0;
@@ -64,6 +68,19 @@ inline T nextPowerOfTwo(T in) {
   }
   return in << 1u;
 }
+
+template <typename T>
+inline T countSetBits(T in) {
+  // Turn off all but msb.
+  if (in == 0) { return 0; }
+  int count = 1;
+  while ((in & (in - 1u)) != 0) {
+    in &= in - 1u;
+    count++;
+  }
+  return count;
+}
+
 
 struct ConstBuffer {
   const char* ptr;
@@ -123,6 +140,16 @@ public:
 
   virtual size_t fwrite(const void* p, size_t size, size_t count);
   size_t fread(void* ptr, size_t size, size_t count);
+
+  template <typename T>
+  std::unique_ptr<T> read_object() {
+    auto ret = std::unique_ptr<T>(new T);
+    if (this->fread(ret.get(), sizeof(T), 1) != 1) {
+      return std::unique_ptr<T>(nullptr);
+    } else {
+      return ret;
+    }
+  }
 
   bool feof();
   bool ferror();
@@ -187,12 +214,12 @@ class ChecksummingFileHandle : public FileHandle {
 public:
   static constexpr size_t kBufSize = 50 * 1024;
 
-  ChecksummingFileHandle(FILE* fh, Adler32 cksum)
-    : FileHandle(fh), cksum_(std::move(cksum)),
+  ChecksummingFileHandle(FILE* fh, Adler32 checksum)
+    : FileHandle(fh), cksum_(std::move(checksum)),
     buffer_(new char[kBufSize]), buf_pos_(0) {}
 
-  ChecksummingFileHandle(FileHandle fh, Adler32 cksum)
-    : FileHandle(std::move(fh)), cksum_(std::move(cksum)),
+  ChecksummingFileHandle(FileHandle fh, Adler32 checksum)
+    : FileHandle(std::move(fh)), cksum_(std::move(checksum)),
     buffer_(new char[kBufSize]), buf_pos_(0) {}
 
   virtual ~ChecksummingFileHandle() {

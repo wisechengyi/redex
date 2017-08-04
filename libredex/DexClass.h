@@ -385,6 +385,10 @@ class DexTypeList {
  public:
   const std::deque<DexType*>& get_type_list() const { return m_list; }
 
+  size_t size() const {
+    return get_type_list().size();
+  }
+
   /**
    * Returns size of the encoded typelist in bytes, input
    * pointer must be aligned.
@@ -418,6 +422,12 @@ inline bool compare_dextypelists(DexTypeList* a, DexTypeList* b) {
   }
   return *a < *b;
 }
+
+struct dextypelists_comparator {
+  bool operator()(DexTypeList* a, DexTypeList* b) {
+    return compare_dextypelists(a, b);
+  }
+};
 
 class DexProto {
   friend struct RedexContext;
@@ -455,6 +465,7 @@ class DexProto {
   DexType* get_rtype() const { return m_rtype; }
   DexTypeList* get_args() const { return m_args; }
   DexString* get_shorty() const { return m_shorty; }
+  bool is_void() const { return get_rtype() == DexType::make_type("V"); }
 
   void gather_types(std::vector<DexType*>& ltype) const;
   void gather_strings(std::vector<DexString*>& lstring) const;
@@ -906,6 +917,7 @@ class DexClass {
   void remove_field(const DexField* f);
   void sort_methods();
   void sort_fields();
+  DexField* find_field(const char* name, const DexType* field_type) const;
 
   DexAnnotationDirectory* get_annotation_directory();
   DexAccessFlags get_access() const { return m_access_flags; }

@@ -70,7 +70,7 @@ DexType* get_enum_type() {
   return DexType::make_type("Ljava/lang/Enum;");
 }
 
-bool is_primitive(DexType* type) {
+bool is_primitive(const DexType* type) {
   auto const name = type->get_name()->c_str();
   switch (name[0]) {
   case 'Z':
@@ -90,7 +90,7 @@ bool is_primitive(DexType* type) {
   not_reached();
 }
 
-bool is_wide_type(DexType* type) {
+bool is_wide_type(const DexType* type) {
   auto const name = type->get_name()->c_str();
   switch (name[0]) {
   case 'J':
@@ -131,7 +131,7 @@ DataType type_to_datatype(const DexType* t) {
   not_reached();
 }
 
-char type_shorty(DexType* type) {
+char type_shorty(const DexType* type) {
   auto const name = type->get_name()->c_str();
   switch (name[0]) {
   case '[':
@@ -151,7 +151,7 @@ char type_shorty(DexType* type) {
   not_reached();
 }
 
-bool check_cast(DexType* type, DexType* base_type) {
+bool check_cast(const DexType* type, const DexType* base_type) {
   if (type == base_type) return true;
   const auto cls = type_class(type);
   if (cls == nullptr) return false;
@@ -192,6 +192,11 @@ DexAccessFlags merge_visibility(uint32_t vis1, uint32_t vis2) {
 
 bool is_array(const DexType* type) {
   return type->get_name()->c_str()[0] == '[';
+}
+
+bool is_object(const DexType* type) {
+  char sig = type->get_name()->c_str()[0];
+  return (sig == 'L') || (sig == '[');
 }
 
 uint32_t get_array_level(const DexType* type) {
@@ -331,6 +336,7 @@ void load_root_dexen(
   // Load all discovered dex files
   for (const auto& dex : dexen) {
     std::cout << "Loading " << dex.string() << std::endl;
+    // N.B. throaway stats for now
     DexClasses classes = load_classes_from_dex(dex.c_str(), balloon);
     store.add_classes(std::move(classes));
   }
@@ -349,4 +355,22 @@ size_t sum_param_sizes(const IRCode* code) {
     size += mie.insn->dest_is_wide() ? 2 : 1;
   }
   return size;
+}
+
+dex_stats_t&
+  operator+=(dex_stats_t& lhs, const dex_stats_t& rhs) {
+  lhs.num_types += rhs.num_types;
+  lhs.num_classes += rhs.num_classes;
+  lhs.num_methods += rhs.num_methods;
+  lhs.num_method_refs += rhs.num_method_refs;
+  lhs.num_fields += rhs.num_fields;
+  lhs.num_field_refs += rhs.num_field_refs;
+  lhs.num_strings += rhs.num_strings;
+  lhs.num_protos += rhs.num_protos;
+  lhs.num_static_values += rhs.num_static_values;
+  lhs.num_annotations += rhs.num_annotations;
+  lhs.num_type_lists += rhs.num_type_lists;
+  lhs.num_bytes += rhs.num_bytes;
+  lhs.num_instructions += rhs.num_instructions;
+  return lhs;
 }

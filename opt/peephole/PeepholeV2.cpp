@@ -19,9 +19,9 @@
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "IRInstruction.h"
+#include "ParallelWalkers.h"
 #include "PassManager.h"
 #include "RedundantCheckCastRemover.h"
-#include "Walkers.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 // PeepholeOptimizerV2 implementation
@@ -348,65 +348,66 @@ struct Matcher {
       return true;
     };
 
-    auto match_literal = [&](Literal pattern, int64_t insn_literal_val) {
-      if (matched_literals.find(pattern) != end(matched_literals)) {
-        return matched_literals.at(pattern) == insn_literal_val;
+    auto match_literal = [&](Literal lit_pattern, int64_t insn_literal_val) {
+      if (matched_literals.find(lit_pattern) != end(matched_literals)) {
+        return matched_literals.at(lit_pattern) == insn_literal_val;
       }
-      matched_literals.emplace(pattern, insn_literal_val);
+      matched_literals.emplace(lit_pattern, insn_literal_val);
       return true;
     };
 
-    auto match_string = [&](String pattern, DexString* insn_str) {
-      if (pattern == String::empty) {
+    auto match_string = [&](String str_pattern, DexString* insn_str) {
+      if (str_pattern == String::empty) {
         return (insn_str->is_simple() && insn_str->size() == 0);
       }
-      if (matched_strings.find(pattern) != end(matched_strings)) {
-        return matched_strings.at(pattern) == insn_str;
+      if (matched_strings.find(str_pattern) != end(matched_strings)) {
+        return matched_strings.at(str_pattern) == insn_str;
       }
-      matched_strings.emplace(pattern, insn_str);
+      matched_strings.emplace(str_pattern, insn_str);
       return true;
     };
 
-    auto match_type = [&](Type pattern, DexType* insn_type) {
-      if (matched_types.find(pattern) != end(matched_types)) {
-        return matched_types.at(pattern) == insn_type;
+    auto match_type = [&](Type type_pattern, DexType* insn_type) {
+      if (matched_types.find(type_pattern) != end(matched_types)) {
+        return matched_types.at(type_pattern) == insn_type;
       }
-      matched_types.emplace(pattern, insn_type);
+      matched_types.emplace(type_pattern, insn_type);
       return true;
     };
 
     // Does 'insn' match to the given DexPattern?
-    auto match_instruction = [&](const DexPattern& pattern) {
-      if (pattern.opcodes.find(insn->opcode()) == end(pattern.opcodes) ||
-          pattern.srcs.size() != insn->srcs_size() ||
-          pattern.dests.size() != insn->dests_size()) {
+    auto match_instruction = [&](const DexPattern& dex_pattern) {
+      if (dex_pattern.opcodes.find(insn->opcode()) ==
+              end(dex_pattern.opcodes) ||
+          dex_pattern.srcs.size() != insn->srcs_size() ||
+          dex_pattern.dests.size() != insn->dests_size()) {
         return false;
       }
 
-      if (pattern.dests.size() != 0) {
-        assert(pattern.dests.size() == 1);
-        if (!match_reg(pattern.dests[0], insn->dest())) {
+      if (dex_pattern.dests.size() != 0) {
+        assert(dex_pattern.dests.size() == 1);
+        if (!match_reg(dex_pattern.dests[0], insn->dest())) {
           return false;
         }
       }
 
-      for (size_t i = 0; i < pattern.srcs.size(); ++i) {
-        if (!match_reg(pattern.srcs[i], insn->src(i))) {
+      for (size_t i = 0; i < dex_pattern.srcs.size(); ++i) {
+        if (!match_reg(dex_pattern.srcs[i], insn->src(i))) {
           return false;
         }
       }
 
-      switch (pattern.kind) {
+      switch (dex_pattern.kind) {
       case DexPattern::Kind::none:
         return true;
       case DexPattern::Kind::string:
-        return match_string(pattern.string, insn->get_string());
+        return match_string(dex_pattern.string, insn->get_string());
       case DexPattern::Kind::literal:
-        return match_literal(pattern.literal, insn->literal());
+        return match_literal(dex_pattern.literal, insn->literal());
       case DexPattern::Kind::method:
-        return pattern.method == insn->get_method();
+        return dex_pattern.method == insn->get_method();
       case DexPattern::Kind::type:
-        return match_type(pattern.type, insn->get_type());
+        return match_type(dex_pattern.type, insn->get_type());
       case DexPattern::Kind::copy:
         always_assert_log(
             false, "Kind::copy can only be used in replacements. Not matches");
@@ -622,8 +623,7 @@ struct Matcher {
           auto a = matched_strings.at(String::A)->c_str();
           int b = matched_literals.at(Literal::A);
           auto bchar = encode_utf8_char_to_mutf8_string(b);
-          replace->set_string(
-              DexString::make_string(std::string(a) + bchar));
+          replace->set_string(DexString::make_string(std::string(a) + bchar));
           break;
         }
         case String::Type_A_get_simple_name: {
@@ -1243,18 +1243,16 @@ bool contains(const std::vector<T>& vec, const T& value) {
 
 class PeepholeOptimizerV2 {
  private:
-  const std::vector<DexClass*>& m_scope;
   std::vector<Matcher> m_matchers;
+  std::vector<size_t> m_stats;
   PassManager& m_mgr;
   int m_stats_removed = 0;
   int m_stats_inserted = 0;
 
  public:
   explicit PeepholeOptimizerV2(
-      PassManager& mgr,
-      const std::vector<DexClass*>& scope,
-      const std::vector<std::string>& disabled_peepholes)
-      : m_scope(scope), m_mgr(mgr) {
+      PassManager& mgr, const std::vector<std::string>& disabled_peepholes)
+      : m_mgr(mgr) {
     for (const auto& pattern_list : patterns::get_all_patterns()) {
       for (const Pattern& pattern : pattern_list) {
         if (!contains(disabled_peepholes, pattern.name)) {
@@ -1267,7 +1265,11 @@ class PeepholeOptimizerV2 {
         }
       }
     }
+    m_stats.resize(m_matchers.size(), 0);
   }
+
+  PeepholeOptimizerV2(const PeepholeOptimizerV2&) = delete;
+  PeepholeOptimizerV2& operator=(const PeepholeOptimizerV2&) = delete;
 
   void peephole(DexMethod* method) {
     auto code = method->get_code();
@@ -1290,7 +1292,7 @@ class PeepholeOptimizerV2 {
           if (!matcher.try_match(mei.insn)) {
             continue;
           }
-          m_mgr.incr_metric(m_matchers[i].pattern.name.c_str(), 1);
+          m_stats.at(i)++;
           TRACE(PEEPHOLE, 8, "PATTERN MATCHED!\n");
           deletes.insert(end(deletes),
                          begin(matcher.matched_instructions),
@@ -1346,14 +1348,16 @@ class PeepholeOptimizerV2 {
     }
   }
 
-  void run() {
-    walk_methods(m_scope, [&](DexMethod* m) {
-      if (m->get_code()) {
-        peephole(m);
-      }
-    });
+  void run_method(DexMethod* m) {
+    if (m->get_code()) {
+      peephole(m);
+    }
+  }
 
-    print_stats();
+  void incr_all_metrics() {
+    for (size_t i = 0; i < m_matchers.size(); i++) {
+      m_mgr.incr_metric(m_matchers[i].pattern.name.c_str(), m_stats[i]);
+    }
   }
 };
 }
@@ -1362,7 +1366,23 @@ void PeepholePassV2::run_pass(DexStoresVector& stores,
                               ConfigFiles& /*cfg*/,
                               PassManager& mgr) {
   auto scope = build_class_scope(stores);
-  PeepholeOptimizerV2(mgr, scope, config.disabled_peepholes).run();
+  std::vector<std::unique_ptr<PeepholeOptimizerV2>> helpers;
+  walk_methods_parallel<Scope, PeepholeOptimizerV2*, std::nullptr_t>(
+      scope,
+      [](PeepholeOptimizerV2*& ph, DexMethod* m) { // walker
+        ph->run_method(m);
+        return nullptr;
+      },
+      [](std::nullptr_t, std::nullptr_t) { return nullptr; }, // reducer
+      [&](unsigned int /*thread_index*/) { // data initializer
+        helpers.emplace_back(std::make_unique<PeepholeOptimizerV2>(
+            mgr, config.disabled_peepholes));
+        return helpers.back().get();
+      });
+  for (const auto& helper : helpers) {
+    helper->incr_all_metrics();
+  }
+
   if (!contains<std::string>(config.disabled_peepholes,
                              RedundantCheckCastRemover::get_name())) {
     RedundantCheckCastRemover(mgr, scope).run();

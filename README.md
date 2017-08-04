@@ -56,7 +56,8 @@ cd redex
 
 Now, build ReDex using autoconf and make.
 ```
-autoreconf -ivf && ./configure && make
+# if you're using gcc, please use gcc-4.9
+autoreconf -ivf && ./configure && make -j4
 sudo make install
 ```
 
@@ -119,6 +120,40 @@ appropriate args:
 -s [KEYSTORE], --keystore [KEYSTORE]
 -a [KEYALIAS], --keyalias [KEYALIAS]
 -p [KEYPASS], --keypass [KEYPASS]
+```
+
+## My App crashes with `MethodNotFoundException`, `ClassNotFoundException`, `NoSuchFieldException`, or something similar. How do I fix this?
+
+Redex probably deleted or renamed it. Redex is quite aggressive about deleting
+things it deems are unreachable. But, often Redex doesn't know about reflection
+or other complex ways an entity could be reached.
+
+Here's how you ensure Redex will not delete or rename something:
+
+Annotate any class, method, or field you want to keep with `@DoNotStrip`.
+
+Add this to your redex config (at the uppermost level of the json) to
+prevent deletion:
+```
+"keep_annotations": [
+  "Lcom/path/to/your/DoNotStrip;"
+]
+```
+
+and add this to your config to prevent renaming:
+```
+"RenameClassesPassV2" : {
+  "dont_rename_annotated": [
+    "Lcom/path/to/your/DoNotStrip;"
+  ]
+}
+```
+
+and define `DoNotStrip`:
+
+```
+package com.path.to.your;
+public @interface DoNotStrip {}
 ```
 
 ## How does this compare to ProGuard?

@@ -7,6 +7,7 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
+#include <cmath>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -124,6 +125,7 @@ TEST_F(RegAllocTest, LiveRangeSingleBlock) {
   code->push_back(dasm(OPCODE_NEW_INSTANCE, get_object_type(), {0_v}));
   code->push_back(dasm(OPCODE_CHECK_CAST, get_object_type(), {0_v, 0_v}));
 
+  code->build_cfg();
   live_range::renumber_registers(code);
 
   InstructionList expected_insns {
@@ -158,6 +160,7 @@ TEST_F(RegAllocTest, LiveRange) {
 
   code->push_back(dasm(OPCODE_CHECK_CAST, get_object_type(), {0_v, 0_v}));
 
+  code->build_cfg();
   live_range::renumber_registers(code);
 
   InstructionList expected_insns {
@@ -229,6 +232,25 @@ TEST_F(RegAllocTest, VirtualRegistersFile) {
   EXPECT_EQ(vreg_file.size(), 9);
 }
 
+TEST_F(RegAllocTest, InterferenceWeights) {
+  using namespace interference::impl;
+  // Check that our div_ceil implementation is consistent with the more
+  // obviously correct alternative of converting to a double before dividing
+  auto fp_div_ceil = [](double x, double y) -> uint32_t { return ceil(x / y); };
+  for (uint8_t width = 1; width < 2; ++width) {
+    // This is the calculation for colorable_limit()
+    EXPECT_EQ(div_ceil(max_unsigned_value(16) + 1, 2 * width - 1),
+              fp_div_ceil(max_unsigned_value(16) + 1, 2 * width - 1));
+  }
+
+  // Check that our optimized edge_weight calculation is consistent with the
+  // slower division-based method
+  EXPECT_EQ(fp_div_ceil(1, 1), edge_weight(1, 1));
+  EXPECT_EQ(fp_div_ceil(1, 2), edge_weight(2, 1));
+  EXPECT_EQ(fp_div_ceil(2, 1), edge_weight(1, 2));
+  EXPECT_EQ(fp_div_ceil(2, 2), edge_weight(2, 2));
+}
+
 TEST_F(RegAllocTest, BuildInterferenceGraph) {
   using namespace dex_asm;
 
@@ -266,6 +288,15 @@ TEST_F(RegAllocTest, BuildInterferenceGraph) {
   EXPECT_EQ(ig.get_node(3).max_vreg(), 255);
   EXPECT_EQ(ig.get_node(3).adjacent(), std::vector<reg_t>{});
   EXPECT_EQ(ig.get_node(3).type(), RegisterType::NORMAL);
+
+  // Check that the adjacency matrix is consistent with the adjacency lists
+  for (auto& pair : ig.nodes()) {
+    auto reg = pair.first;
+    for (auto adj : pair.second.adjacent()) {
+      EXPECT_TRUE(ig.is_adjacent(reg, adj));
+      EXPECT_TRUE(ig.is_adjacent(adj, reg));
+    }
+  }
 }
 
 TEST_F(RegAllocTest, Coalesce) {
@@ -289,6 +320,68 @@ TEST_F(RegAllocTest, Coalesce) {
     dasm(OPCODE_CONST_4, {0_v, 0_L}),
     // move opcode was coalesced
     dasm(OPCODE_RETURN, {0_v})
+  };
+  EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
+}
+
+TEST_F(RegAllocTest, MoveWideCoalesce) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  code.push_back(dasm(OPCODE_CONST_WIDE, {0_v, 0_L}));
+  code.push_back(dasm(OPCODE_MOVE_WIDE, {1_v, 0_v}));
+  code.push_back(dasm(OPCODE_RETURN_WIDE, {1_v}));
+  code.set_registers_size(2);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+
+  EXPECT_TRUE(ig.is_coalesceable(0, 1));
+  EXPECT_TRUE(ig.is_adjacent(0, 1));
+
+  graph_coloring::Allocator allocator;
+  allocator.coalesce(&ig, &code);
+  InstructionList expected_insns {
+    dasm(OPCODE_CONST_WIDE, {0_v, 0_L}),
+    // move-wide opcode was coalesced
+    dasm(OPCODE_RETURN_WIDE, {0_v})
+  };
+  EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
+}
+
+TEST_F(RegAllocTest, NoCoalesceWide) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  code.push_back(dasm(OPCODE_CONST_WIDE, {0_v, 0_L}));
+  code.push_back(dasm(OPCODE_MOVE_WIDE, {1_v, 0_v}));
+  code.push_back(dasm(OPCODE_LONG_TO_DOUBLE, {1_v, 0_v}));
+  code.push_back(dasm(OPCODE_RETURN_WIDE, {0_v}));
+  code.set_registers_size(2);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+
+  EXPECT_FALSE(ig.is_coalesceable(0, 1));
+  EXPECT_TRUE(ig.is_adjacent(0, 1));
+
+  graph_coloring::Allocator allocator;
+  allocator.coalesce(&ig, &code);
+  InstructionList expected_insns {
+    dasm(OPCODE_CONST_WIDE, {0_v, 0_L}),
+    // This move can't be coalesced away due to the long-to-double instruction
+    // below
+    dasm(OPCODE_MOVE_WIDE, {1_v, 0_v}),
+    dasm(OPCODE_LONG_TO_DOUBLE, {1_v, 0_v}),
+    dasm(OPCODE_RETURN_WIDE, {0_v})
   };
   EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
 }
@@ -367,7 +460,7 @@ TEST_F(RegAllocTest, SelectRange) {
       OPCODE_INVOKE_STATIC, many_args_method, {0_v, 1_v, 2_v, 3_v, 4_v, 5_v}));
   code.push_back(dasm(OPCODE_ADD_INT, {3_v, 0_v, 6_v}));
   code.push_back(dasm(OPCODE_RETURN, {3_v}));
-  code.set_registers_size(6);
+  code.set_registers_size(7);
   code.build_cfg();
 
   RangeSet range_set = init_range_set(&code);
@@ -434,7 +527,174 @@ TEST_F(RegAllocTest, Spill) {
   code.push_back(dasm(OPCODE_CONST_4, {1_v, 1_L}));
   code.push_back(dasm(OPCODE_ADD_INT, {2_v, 0_v, 1_v}));
   code.push_back(dasm(OPCODE_RETURN, {2_v}));
-  code.set_registers_size(2);
+  code.set_registers_size(3);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+
+  SplitPlan split_plan;
+  graph_coloring::SpillPlan spill_plan;
+  spill_plan.global_spills = std::unordered_map<reg_t, reg_t> {
+    {0, 16},
+    {1, 16},
+    {2, 256},
+  };
+  std::unordered_set<reg_t> new_temps;
+  graph_coloring::Allocator allocator;
+  allocator.spill(ig, spill_plan, range_set, &code, &new_temps);
+
+  InstructionList expected_insns {
+    dasm(OPCODE_CONST_4, {3_v, 1_L}),
+    dasm(OPCODE_MOVE_16, {0_v, 3_v}),
+    dasm(OPCODE_CONST_4, {4_v, 1_L}),
+    dasm(OPCODE_MOVE_16, {1_v, 4_v}),
+
+    // srcs not spilled -- add-int can address up to 8-bit-sized operands
+    dasm(OPCODE_ADD_INT, {5_v, 0_v, 1_v}),
+    dasm(OPCODE_MOVE_16, {2_v, 5_v}),
+
+    dasm(OPCODE_MOVE_16, {6_v, 2_v}),
+    dasm(OPCODE_RETURN, {6_v})
+  };
+  EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
+}
+
+TEST_F(RegAllocTest, ContainmentGraph) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {"I", "I"});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  EXPECT_EQ(*code.begin()->insn, *dasm(IOPCODE_LOAD_PARAM, {0_v}));
+  EXPECT_EQ(*std::next(code.begin())->insn, *dasm(IOPCODE_LOAD_PARAM, {1_v}));
+  code.push_back(dasm(OPCODE_MOVE, {2_v, 0_v}));
+  code.push_back(dasm(OPCODE_MOVE, {3_v, 1_v}));
+  code.push_back(dasm(OPCODE_ADD_INT, {4_v, 2_v, 3_v}));
+  code.push_back(dasm(OPCODE_RETURN, {4_v}));
+  code.set_registers_size(5);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+  EXPECT_TRUE(ig.has_containment_edge(0, 1));
+  EXPECT_TRUE(ig.has_containment_edge(1, 0));
+  EXPECT_TRUE(ig.has_containment_edge(1, 2));
+  EXPECT_TRUE(ig.has_containment_edge(2, 1));
+  EXPECT_TRUE(ig.has_containment_edge(3, 2));
+
+  EXPECT_FALSE(ig.has_containment_edge(4, 2));
+  EXPECT_FALSE(ig.has_containment_edge(2, 4));
+  EXPECT_FALSE(ig.has_containment_edge(4, 3));
+  EXPECT_FALSE(ig.has_containment_edge(3, 4));
+
+  EXPECT_FALSE(ig.has_containment_edge(0, 4));
+  EXPECT_FALSE(ig.has_containment_edge(1, 4));
+  EXPECT_FALSE(ig.has_containment_edge(4, 0));
+  EXPECT_FALSE(ig.has_containment_edge(4, 1));
+
+  graph_coloring::Allocator allocator;
+  allocator.coalesce(&ig, &code);
+  InstructionList expected_insns{dasm(IOPCODE_LOAD_PARAM, {0_v}),
+                                 dasm(IOPCODE_LOAD_PARAM, {1_v}),
+                                 // move opcode was coalesced
+                                 dasm(OPCODE_ADD_INT, {0_v, 0_v, 1_v}),
+                                 dasm(OPCODE_RETURN, {0_v})};
+  EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
+  EXPECT_TRUE(ig.has_containment_edge(1, 0));
+  EXPECT_TRUE(ig.has_containment_edge(0, 1));
+}
+
+TEST_F(RegAllocTest, FindSplit) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  code.push_back(dasm(OPCODE_CONST_4, {0_v, 1_L}));
+  code.push_back(dasm(OPCODE_CONST_4, {1_v, 1_L}));
+  code.push_back(dasm(OPCODE_MOVE, {2_v, 1_v}));
+  code.push_back(dasm(OPCODE_MOVE, {4_v, 1_v}));
+  code.push_back(dasm(OPCODE_MOVE, {3_v, 0_v}));
+  code.push_back(dasm(OPCODE_RETURN, {3_v}));
+  code.set_registers_size(5);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+
+  SplitCosts split_costs;
+  SplitPlan split_plan;
+  graph_coloring::SpillPlan spill_plan;
+  spill_plan.global_spills = std::unordered_map<reg_t, reg_t>{{1, 16}};
+  graph_coloring::RegisterTransform reg_transform;
+  reg_transform.map = transform::RegMap{{0, 0}, {2, 1}, {4, 1}, {3, 1}};
+  graph_coloring::Allocator allocator;
+  allocator.spill_costs(&code, ig, range_set, &spill_plan);
+  calc_split_costs(&code, &split_costs);
+  allocator.find_split(
+      ig, split_costs, &reg_transform, &spill_plan, &split_plan);
+  EXPECT_EQ(split_plan.split_around.at(1), std::unordered_set<reg_t>{0});
+}
+
+TEST_F(RegAllocTest, Split) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  code.push_back(dasm(OPCODE_CONST_4, {0_v, 1_L}));
+  code.push_back(dasm(OPCODE_CONST_4, {1_v, 1_L}));
+  code.push_back(dasm(OPCODE_MOVE, {2_v, 1_v}));
+  code.push_back(dasm(OPCODE_MOVE, {4_v, 1_v}));
+  code.push_back(dasm(OPCODE_MOVE, {3_v, 0_v}));
+  code.push_back(dasm(OPCODE_RETURN, {3_v}));
+  code.set_registers_size(5);
+  code.build_cfg();
+
+  RangeSet range_set;
+  interference::Graph ig =
+      interference::build_graph(&code, code.get_registers_size(), range_set);
+
+  SplitCosts split_costs;
+  SplitPlan split_plan;
+  graph_coloring::SpillPlan spill_plan;
+  // split 0 around 1
+  split_plan.split_around =
+      std::unordered_map<reg_t, std::unordered_set<reg_t>>{
+          {1, std::unordered_set<reg_t>{0}}};
+  graph_coloring::Allocator allocator;
+  std::unordered_set<reg_t> new_temps;
+  allocator.spill(ig, spill_plan, range_set, &code, &new_temps);
+  split(split_plan, split_costs, ig, &code);
+  InstructionList expected_insns{dasm(OPCODE_CONST_4, {0_v, 1_L}),
+                                 dasm(OPCODE_MOVE_16, {5_v, 0_v}),
+
+                                 dasm(OPCODE_CONST_4, {1_v, 1_L}),
+                                 dasm(OPCODE_MOVE, {2_v, 1_v}),
+                                 dasm(OPCODE_MOVE, {4_v, 1_v}),
+                                 dasm(OPCODE_MOVE_16, {0_v, 5_v}),
+
+                                 dasm(OPCODE_MOVE, {3_v, 0_v}),
+                                 dasm(OPCODE_RETURN, {3_v})};
+  EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
+}
+
+TEST_F(RegAllocTest, ParamFirstUse) {
+  using namespace dex_asm;
+
+  DexMethod* method = DexMethod::make_method("Lfoo;", "bar", "I", {"I", "I"});
+  method->make_concrete(ACC_STATIC, false);
+  IRCode code(method, 0);
+  EXPECT_EQ(*code.begin()->insn, *dasm(IOPCODE_LOAD_PARAM, {0_v}));
+  EXPECT_EQ(*std::next(code.begin())->insn, *dasm(IOPCODE_LOAD_PARAM, {1_v}));
+  code.push_back(dasm(OPCODE_CONST_4, {2_v}));
+  code.push_back(dasm(OPCODE_ADD_INT, {3_v, 0_v, 2_v}));
+  code.push_back(dasm(OPCODE_RETURN, {3_v}));
+  code.set_registers_size(4);
   code.build_cfg();
 
   RangeSet range_set;
@@ -442,26 +702,23 @@ TEST_F(RegAllocTest, Spill) {
       interference::build_graph(&code, code.get_registers_size(), range_set);
 
   graph_coloring::SpillPlan spill_plan;
-  spill_plan.global_spills = std::unordered_map<reg_t, reg_t> {
-    {0, 16},
-    {1, 16},
-    {2, 256},
-  };
+  spill_plan.param_spills = std::unordered_set<reg_t> { 0, 1 };
+  std::unordered_set<reg_t> new_temps;
   graph_coloring::Allocator allocator;
-  allocator.spill(ig, spill_plan, range_set, &code);
+  auto load_param = allocator.find_param_first_uses(spill_plan.param_spills, &code);
+  // No use of 1.
+  EXPECT_EQ(load_param.size(), 1);
+  allocator.spill_params(ig, load_param, &code, &new_temps);
 
   InstructionList expected_insns {
-    dasm(OPCODE_CONST_4, {2_v, 1_L}),
-    dasm(OPCODE_MOVE_16, {0_v, 2_v}),
-    dasm(OPCODE_CONST_4, {3_v, 1_L}),
-    dasm(OPCODE_MOVE_16, {1_v, 3_v}),
+    dasm(IOPCODE_LOAD_PARAM, {4_v}),
+    dasm(IOPCODE_LOAD_PARAM, {1_v}),
+    dasm(OPCODE_CONST_4, {2_v}),
 
-    // srcs not spilled -- add-int can address up to 8-bit-sized operands
-    dasm(OPCODE_ADD_INT, {4_v, 0_v, 1_v}),
-    dasm(OPCODE_MOVE_16, {2_v, 4_v}),
-
-    dasm(OPCODE_MOVE_16, {5_v, 2_v}),
-    dasm(OPCODE_RETURN, {5_v})
+    // Move is inserted before first use.
+    dasm(OPCODE_MOVE_16, {0_v, 4_v}),
+    dasm(OPCODE_ADD_INT, {3_v, 0_v, 2_v}),
+    dasm(OPCODE_RETURN, {3_v}),
   };
   EXPECT_TRUE(expected_insns.matches(InstructionIterable(code)));
 }

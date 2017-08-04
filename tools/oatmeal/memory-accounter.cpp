@@ -16,6 +16,27 @@
 
 namespace {
 
+// This class is a bit of a wart - the oat parsing code was initially written
+// only for exploratory purposes, and MemoryAccounter exists so that we can
+// make sure we've parsed and therefore understood all the bytes in an oat file.
+// But now we're adding the ability to do oat parsing on device, for the purposes
+// of madvise()ing regions of the oat file that correspond to various dex files,
+// in which case we want to be able to run without forcing the caller to call
+// MemoryAccounter::NewScope().
+//
+// Adding this stub class is easier than putting in null checks everywhere we
+// call cur_ma().
+class NilMemoryAccounterImpl : public MemoryAccounter {
+public:
+  void print() override {}
+  void memcpyAndMark(void* dest, const char* src, size_t count) override {
+    memcpy(dest, src, count);
+  }
+  void markRangeConsumed(uint32_t, uint32_t) override {}
+  void markRangeConsumed(const char*, uint32_t) override {}
+  void markBufferConsumed(ConstBuffer) override {}
+};
+
 class MemoryAccounterImpl : public MemoryAccounter {
  friend class ::MemoryAccounterScope;
  public:
@@ -57,23 +78,20 @@ class MemoryAccounterImpl : public MemoryAccounter {
     CHECK(src >= buf_.ptr);
     uint32_t begin = src - buf_.ptr;
     uint32_t end = begin + count;
-    CHECK(end <= buf_.len);
 
-    consumed_ranges_.emplace_back(begin, end);
+    markRangeImpl(begin, end);
     memcpy(dest, src, count);
   }
 
   void markRangeConsumed(uint32_t begin, uint32_t count) override {
     uint32_t end = begin + count;
-    CHECK(end <= buf_.len);
-    consumed_ranges_.emplace_back(begin, end);
+    markRangeImpl(begin, end);
   }
 
   void markRangeConsumed(const char* ptr, uint32_t count) override {
     uint32_t begin = ptr - buf_.ptr;
     uint32_t end = begin + count;
-    CHECK(end <= buf_.len);
-    consumed_ranges_.emplace_back(begin, end);
+    markRangeImpl(begin, end);
   }
 
   void markBufferConsumed(ConstBuffer subBuffer) override {
@@ -81,7 +99,9 @@ class MemoryAccounterImpl : public MemoryAccounter {
   }
 
   static MemoryAccounter* Cur() {
-    CHECK(accounter_stack_.size() > 0);
+    if (accounter_stack_.size() == 0) {
+      return &nil_accounter_;
+    }
     return accounter_stack_.back().get();
   }
 
@@ -95,9 +115,16 @@ class MemoryAccounterImpl : public MemoryAccounter {
   ConstBuffer buf_;
   std::vector<Range> consumed_ranges_;
 
+  static NilMemoryAccounterImpl nil_accounter_;
   static std::vector<std::unique_ptr<MemoryAccounter>> accounter_stack_;
+
+  void markRangeImpl(uint32_t begin, uint32_t end) {
+    CHECK(begin <= end && end <= buf_.len);
+    consumed_ranges_.emplace_back(begin, end);
+  }
 };
 
+NilMemoryAccounterImpl MemoryAccounterImpl::nil_accounter_;
 std::vector<std::unique_ptr<MemoryAccounter>> MemoryAccounterImpl::accounter_stack_;
 
 }

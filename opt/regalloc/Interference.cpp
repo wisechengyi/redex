@@ -14,68 +14,11 @@
 #include "FixpointIterators.h"
 #include "Transform.h"
 
-namespace {
-
-using namespace regalloc;
-using namespace regalloc::interference;
-using namespace std::placeholders;
-
-class LivenessFixpointIterator final
-    : public MonotonicFixpointIterator<Block*, LivenessDomain> {
- public:
-  using NodeId = Block*;
-
-  LivenessFixpointIterator(NodeId exit_block)
-      : MonotonicFixpointIterator(exit_block,
-                                  std::bind(&Block::preds, _1),
-                                  std::bind(&Block::succs, _1)) {}
-
-  void analyze_node(const NodeId& block,
-                    LivenessDomain* current_state) const override {
-    for (auto it = block->rbegin(); it != block->rend(); ++it) {
-      if (it->type == MFLOW_OPCODE) {
-        analyze_instruction(it->insn, current_state);
-      }
-    }
-  }
-
-  LivenessDomain analyze_edge(
-      const NodeId& /* source_block */,
-      const NodeId& /* target_block */,
-      const LivenessDomain& exit_state_at_source) const override {
-    return exit_state_at_source;
-  }
-
-  void analyze_instruction(const IRInstruction* insn,
-                           LivenessDomain* current_state) const {
-    if (insn->dests_size()) {
-      current_state->remove(insn->dest());
-    }
-    for (size_t i = 0; i < insn->srcs_size(); ++i) {
-      current_state->add(insn->src(i));
-    }
-    always_assert(!opcode::has_range(insn->opcode()));
-  }
-
-  LivenessDomain get_live_in_vars_at(const NodeId& block) const {
-    return get_exit_state_at(block);
-  }
-
-  LivenessDomain get_live_out_vars_at(const NodeId& block) const {
-    return get_entry_state_at(block);
-  }
-};
-
-} // namespace
-
 namespace regalloc {
 
 namespace interference {
 
-using namespace impl;
-
-/* Returns ⌈a/b⌉ */
-static uint8_t div_ceil(uint8_t a, uint8_t b) { return (a + b - 1) / b; }
+namespace impl {
 
 /*
  * We determine a node's colorability using equation E.3 in [Smith00] for
@@ -96,24 +39,43 @@ static uint8_t div_ceil(uint8_t a, uint8_t b) { return (a + b - 1) / b; }
  *
  * The LHS of the inequality is what we call the "node weight" in our
  * implementation -- it is the sum of the weights of its edges.
+ *
+ * Since this function is very hot, and since division is expensive, we
+ * optimize it by observing that w(x) ∊ { 1, 2 } for all nodes x. Thus we can
+ * replace it by a cheaper sequence of operations that produce the same output
+ * for those inputs.
  */
 
-static uint32_t edge_weight(const Node& u, const Node& v) {
-  return div_ceil(v.width(), u.width());
+uint32_t edge_weight(uint8_t u_width, uint8_t v_width) {
+  return ((v_width - 1) >> (u_width - 1)) + 1;
 }
 
-void Graph::add_edge(reg_t u, reg_t v) {
-  if (u == v || m_adj_matrix.find({u, v}) != m_adj_matrix.end()) {
+} // namespace impl
+
+using namespace impl;
+
+void Graph::add_edge(reg_t u, reg_t v, bool can_coalesce) {
+  if (u == v) {
     return;
   }
-  m_adj_matrix.emplace(u, v);
-  m_adj_matrix.emplace(v, u);
-  auto& u_node = m_nodes.at(u);
-  auto& v_node = m_nodes.at(v);
-  u_node.m_adjacent.push_back(v);
-  v_node.m_adjacent.push_back(u);
-  u_node.m_weight += edge_weight(u_node, v_node);
-  v_node.m_weight += edge_weight(v_node, u_node);
+  if (!is_adjacent(u, v)) {
+    auto& u_node = m_nodes.at(u);
+    auto& v_node = m_nodes.at(v);
+    u_node.m_adjacent.push_back(v);
+    v_node.m_adjacent.push_back(u);
+    u_node.m_weight += edge_weight(u_node.width(), v_node.width());
+    v_node.m_weight += edge_weight(v_node.width(), u_node.width());
+  }
+  // If we have one instruction that creates a coalesceable edge between two
+  // nodes s0 and s1, and another that creates a non-coalesceable edge, those
+  // edges combined must be non-coalesceable. For example, if we have
+  //
+  //   move-wide s0, s1 # s0 and s1 may be coalesceable
+  //   long-to-double s0, s1 # s0 and s1 definitely not coalesceable
+  //
+  // then the final state of the edge between s0 and s1 must be
+  // non-coalesceable.
+  m_adj_matrix[Edge(u, v)] = m_adj_matrix[Edge(u, v)] || !can_coalesce;
 }
 
 uint32_t Node::colorable_limit() const {
@@ -132,10 +94,16 @@ void Graph::combine(reg_t u, reg_t v) {
     if (!t_node.is_active()) {
       continue;
     }
-    add_edge(u, t);
+    add_edge(u, t, is_coalesceable(v, t));
+    if (has_containment_edge(v, t)) {
+      add_containment_edge(u, t);
+    }
+    if (has_containment_edge(t, v)) {
+      add_containment_edge(t, u);
+    }
   }
-  u_node.m_weight -= edge_weight(u_node, v_node);
-  v_node.m_weight -= edge_weight(v_node, u_node);
+  u_node.m_weight -= edge_weight(u_node.width(), v_node.width());
+  v_node.m_weight -= edge_weight(v_node.width(), u_node.width());
   u_node.m_max_vreg = std::min(u_node.m_max_vreg, v_node.m_max_vreg);
   u_node.m_type_domain.meet_with(v_node.m_type_domain);
   u_node.m_props |= v_node.m_props;
@@ -149,7 +117,7 @@ void Graph::remove_node(reg_t u) {
     if (!v_node.is_active()) {
       continue;
     }
-    v_node.m_weight -= edge_weight(v_node, u_node);
+    v_node.m_weight -= edge_weight(v_node.width(), u_node.width());
   }
   u_node.m_props.reset(Node::ACTIVE);
 }
@@ -167,6 +135,7 @@ void GraphBuilder::update_node_constraints(const IRInstruction* insn,
     node.m_type_domain.meet_with(RegisterTypeDomain(dest_reg_type(insn)));
     node.m_max_vreg =
         std::min(node.m_max_vreg, max_unsigned_value(insn->dest_bit_width()));
+    node.m_width = insn->dest_is_wide() ? 2 : 1;
   }
 
   for (size_t i = 0; i < insn->srcs_size(); ++i) {
@@ -196,7 +165,7 @@ void GraphBuilder::update_node_constraints(const IRInstruction* insn,
   }
 }
 
-static IRInstruction* find_check_cast(const MethodItemEntry& mie) {
+IRInstruction* find_check_cast(const MethodItemEntry& mie) {
   always_assert(mie.type == MFLOW_FALLTHROUGH);
   if (mie.throwing_mie != nullptr &&
       mie.throwing_mie->insn->opcode() == OPCODE_CHECK_CAST) {
@@ -258,7 +227,7 @@ Graph GraphBuilder::build(IRCode* code,
   auto& cfg = code->cfg();
   cfg.calculate_exit_block();
   LivenessFixpointIterator fixpoint_iter(const_cast<Block*>(cfg.exit_block()));
-  fixpoint_iter.run(LivenessDomain());
+  fixpoint_iter.run(LivenessDomain(code->get_registers_size()));
   for (Block* block : cfg.blocks()) {
     LivenessDomain live_out = fixpoint_iter.get_live_out_vars_at(block);
     for (auto it = block->rbegin(); it != block->rend(); ++it) {
@@ -267,6 +236,7 @@ Graph GraphBuilder::build(IRCode* code,
         if (check_cast != nullptr) {
           for (auto reg : live_out.elements()) {
             graph.add_edge(check_cast->dest(), reg);
+            graph.add_containment_edge(check_cast->dest(), reg);
           }
         }
         continue;
@@ -280,22 +250,44 @@ Graph GraphBuilder::build(IRCode* code,
       }
       if (insn->dests_size()) {
         for (auto reg : live_out.elements()) {
-          // We don't want to add interference edges between the src and dest
-          // of a move instruction so that we have the option of coalescing
-          // those live ranges later. However, our current implementation
-          // doesn't work if we leave out the interference edges of move-wide
-          // instructions. If we have `move-wide s0, s1` with both s0 and s1
-          // live-out, and we don't add an edge between s0 and s1, we may end
-          // up with an allocation like `move-wide v0, v1` which is invalid
-          // since v0 is clobbering v1. So we add edges for move-wides, but
-          // that means that they can never be coalesced. FIXME
-          if (is_move(op) && !insn->is_wide() && reg == insn->src(0)) {
+          if (is_move(op) && reg == insn->src(0)) {
             continue;
           }
           graph.add_edge(insn->dest(), reg);
         }
+        // We add interference edges between the wide src and dest operands of
+        // an instruction even if the srcs are not live-out. This avoids
+        // allocations like `xor-long v1, v0, v9`, where v1 and v0 overlap --
+        // even though this is not a verification error, we have observed bugs
+        // in the ART interpreter when handling these sorts of instructions.
+        // However, we still want to be able to coalesce these symregs if they
+        // don't actually interfere based on liveness information, so that we
+        // can remove move-wide opcodes and/or use /2addr encodings.  As such,
+        // we insert a specially marked edge that coalescing ignores but
+        // coloring respects.
+        if (insn->dest_is_wide()) {
+          for (size_t i = 0; i < insn->srcs_size(); ++i) {
+            if (insn->src_is_wide(i)) {
+              graph.add_coalesceable_edge(insn->dest(), insn->src(i));
+            }
+          }
+        }
+      }
+      // adding containment edge between liverange defined in insn and elements
+      // in live-out set of insn
+      if (insn->dests_size()) {
+        for (auto reg : live_out.elements()) {
+          graph.add_containment_edge(insn->dest(), reg);
+        }
       }
       fixpoint_iter.analyze_instruction(it->insn, &live_out);
+      // adding containment edge between liverange used in insn and elements
+      // in live-in set of insn
+      for (size_t i = 0; i < insn->srcs_size(); ++i) {
+        for (auto reg : live_out.elements()) {
+          graph.add_containment_edge(insn->src(i), reg);
+        }
+      }
     }
   }
   for (auto& pair : graph.nodes()) {
@@ -323,6 +315,14 @@ std::ostream& Graph::write_dot_format(std::ostream& o) const {
     }
   }
   o << "}\n";
+
+  o << "containment graph {\n";
+  for (const auto& pair : m_containment_graph) {
+    auto reg1 = pair.first;
+    auto reg2 = pair.second;
+    o << reg1 << " -- " << reg2 << "\n";
+  }
+  o << "}\n";
   return o;
 }
 
@@ -332,11 +332,13 @@ void GraphBuilder::make_node(Graph* graph,
                              reg_t max_vreg) {
   always_assert(graph->m_nodes.find(r) == graph->m_nodes.end());
   graph->m_nodes[r].m_type_domain.meet_with(RegisterTypeDomain(type));
+  graph->m_nodes[r].m_width = type == RegisterType::WIDE ? 2 : 1;
   graph->m_nodes[r].m_max_vreg = max_vreg;
 }
 
 void GraphBuilder::add_edge(Graph* graph, reg_t u, reg_t v) {
-  graph->add_edge(u, v);
+  // Add a non-move(normal) edge.
+  graph->add_edge(u, v, false);
 }
 
 } // namespace interference

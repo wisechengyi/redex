@@ -12,6 +12,8 @@
 #include <stack>
 
 #include "Interference.h"
+#include "Liveness.h"
+#include "Split.h"
 #include "Transform.h"
 
 namespace regalloc {
@@ -36,6 +38,8 @@ struct SpillPlan {
   // Spills for range-instruction-related symbolic registers
   std::unordered_map<const IRInstruction*, std::unordered_set<reg_t>>
       range_spills;
+
+  std::unordered_map<reg_t, size_t> spill_costs;
 
   bool empty() const {
     return global_spills.empty() && param_spills.empty() &&
@@ -75,9 +79,12 @@ class Allocator {
     size_t param_spill_moves{0};
     size_t range_spill_moves{0};
     size_t global_spill_moves{0};
+    size_t split_moves{0};
     size_t moves_coalesced{0};
+    size_t params_spill_early{0};
     size_t moves_inserted() const {
-      return param_spill_moves + range_spill_moves + global_spill_moves;
+      return param_spill_moves + range_spill_moves + global_spill_moves +
+             split_moves;
     }
     size_t net_moves() const { return moves_inserted() - moves_coalesced; }
     void accumulate(const Stats&);
@@ -109,12 +116,33 @@ class Allocator {
                      RegisterTransform*,
                      SpillPlan*);
 
+  void spill_costs(const IRCode*,
+                   const interference::Graph&,
+                   const RangeSet&,
+                   SpillPlan*);
+
+  void find_split(const interference::Graph&,
+                  const SplitCosts&,
+                  RegisterTransform*,
+                  SpillPlan*,
+                  SplitPlan*);
+
+  std::unordered_map<reg_t, std::vector<FatMethod::iterator>>
+  find_param_first_uses(const std::unordered_set<reg_t>&, IRCode*);
+
+  void spill_params(
+      const interference::Graph&,
+      const std::unordered_map<reg_t, std::vector<FatMethod::iterator>>&,
+      IRCode*,
+      std::unordered_set<reg_t>*);
+
   void spill(const interference::Graph&,
              const SpillPlan&,
              const RangeSet&,
-             IRCode*);
+             IRCode*,
+             std::unordered_set<reg_t>*);
 
-  void allocate(IRCode*);
+  void allocate(bool, IRCode*);
 
   const Stats& get_stats() const { return m_stats; }
 

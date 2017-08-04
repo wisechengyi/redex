@@ -7,12 +7,13 @@ def redex_instr_test(
     name,
     java_files,
     config,
+    java_deps = [],
     proguard_config=None,
     verify_srcs=None,
     gen_dex_artifacts=False,
     native_outlining=False,
 ):
-  deps = [
+  deps = java_deps + [
       "//third-party/java/fest:fest",
       "//third-party/java/jsr-305:jsr-305",  ### @Nullable
       "//third-party/java/junit:junit",
@@ -115,6 +116,7 @@ def redex_instr_test(
       name = name + '_verify',
       labels = ['no_lsan'],
       srcs = verify_srcs,
+      compiler_flags=['-std=gnu++14'],
       env = {
         'dex_pre': '$(location :%s_dex_pre)' % name,
         'dex_post': '$(location :%s_dex_post)' % name,
@@ -124,3 +126,10 @@ def redex_instr_test(
         ':%s_dex_post' % name, REDEX_LIB,
         '%s:verify-util' % REDEX_INSTR_ROOT],
     )
+
+
+def redex_test(compiler_flags=[], **kwargs):
+  cxx_test(
+    compiler_flags=compiler_flags+['-std=gnu++14'],
+    **kwargs
+  )
