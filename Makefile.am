@@ -3,7 +3,7 @@ AUTOMAKE_OPTIONS = foreign
 SUBDIRS = . test
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CXXFLAGS = --std=gnu++11 -O0 -Wall -g -fno-inline
+AM_CXXFLAGS = --std=gnu++11 -O0 -Wall -g -fno-inline -rdynamic
 
 #
 # Include paths
